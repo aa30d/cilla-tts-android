@@ -81,6 +81,9 @@ class MainActivity : AppCompatActivity() {
 
         refreshModelState()
         updatePlayButton()
+        if (!engines.hasPersianModel() && !engines.hasEnglishModel()) {
+            setStatus("مدلی نصب نیست. از تب «تنظیمات» مدل فارسی یا انگلیسی را دانلود یا انتخاب کنید.")
+        }
     }
 
     // ---------------------------------------------------------------- tabs
