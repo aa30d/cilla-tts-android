@@ -18,16 +18,21 @@ import kotlin.math.roundToInt
  */
 class CillaTtsService : TextToSpeechService() {
 
-    private lateinit var engines: TtsEngines
+    // TextToSpeechService.onCreate() asks onGetLanguage and onLoadLanguage before it returns, and
+    // those answer from the installed models: the holder therefore has to be usable from the very
+    // first callback, whichever thread it comes from. A lazy builds it on first use, so there is
+    // no window in which a callback can find it missing.
+    private val enginesDelegate = lazy { TtsEngines(applicationContext) }
+    private val engines by enginesDelegate
     private val stopRequested = AtomicBoolean(false)
 
     @Volatile
     private var language: String? = null
 
     override fun onCreate() {
-        super.onCreate()
+        // No model is loaded here, but the threads have to be capped before the first ptts_new.
         Os.setenv("RAYON_NUM_THREADS", "2", true)
-        engines = TtsEngines(applicationContext)
+        super.onCreate()
     }
 
     override fun onIsLanguageAvailable(lang: String?, country: String?, variant: String?): Int {
@@ -127,7 +132,7 @@ class CillaTtsService : TextToSpeechService() {
     override fun onDestroy() {
         super.onDestroy()
         stopRequested.set(true)
-        if (::engines.isInitialized) engines.close()
+        if (enginesDelegate.isInitialized()) engines.close()
     }
 
     /** Android asks in ISO 639 codes: `fas`/`fa`/`per` for Persian, `eng`/`en` for English. */

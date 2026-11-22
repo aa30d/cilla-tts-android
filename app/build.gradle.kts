@@ -11,8 +11,8 @@ android {
         applicationId = "com.cilla.tts"
         minSdk = 26
         targetSdk = 35
-        versionCode = providers.gradleProperty("versionCode").orElse("2").get().toInt()
-        versionName = providers.gradleProperty("versionName").orElse("1.1.0").get()
+        versionCode = providers.gradleProperty("versionCode").orElse("3").get().toInt()
+        versionName = providers.gradleProperty("versionName").orElse("1.1.1").get()
 
         ndk {
             abiFilters += listOf("arm64-v8a", "x86_64")
