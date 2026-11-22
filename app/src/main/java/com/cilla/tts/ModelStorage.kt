@@ -55,7 +55,7 @@ object ModelStorage {
     fun hasCoreFiles(dir: File): Boolean =
         File(dir, CONFIG).isFile && File(dir, TOKENIZER).isFile && weights(dir) != null
 
-    /** Every voice file of a checkpoint, as the loader scans them: `voices/*.safetensors` and `default-voice.safetensors`. */
+    /** Every voice file of a checkpoint, as the loader scans them: the safetensors in `voices/`, plus a root `default-voice.safetensors`. */
     fun voiceFiles(dir: File): List<File> {
         val inVoices = File(dir, "voices").listFiles()
             ?.filter { it.isFile && it.name.endsWith(".safetensors") }
