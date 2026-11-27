@@ -127,9 +127,11 @@ object ModelStorage {
      */
     fun promptDurationBounds(ctx: Context, kind: ModelKind): Pair<Float, Float> {
         val profile = ModelProfile.load(modelDir(ctx, kind))
+        // Both fallbacks are `Double`, like `ModelProfile.prompt*Seconds`, or the elvis result is a
+        // number type the clamp cannot take.
         return AudioDecoder.clampPromptBounds(
             profile?.promptMinSeconds ?: AudioDecoder.MIN_PROMPT_SECONDS.toDouble(),
-            profile?.promptMaxSeconds ?: AudioDecoder.MAX_PROMPT_SECONDS
+            profile?.promptMaxSeconds ?: AudioDecoder.MAX_PROMPT_SECONDS.toDouble()
         )
     }
 
