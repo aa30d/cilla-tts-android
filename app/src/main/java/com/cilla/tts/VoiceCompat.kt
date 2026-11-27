@@ -56,14 +56,20 @@ class ModelProfile(val config: JSONObject) {
 
     /**
      * Channels the checkpoint's speaker projection takes: `speaker_mimi.mimi.inner_dim` when the
-     * checkpoint has one, otherwise that Mimi's `dimension` (`encoder_latent_dim` in xn-ptts).
-     * Null when the config has no `speaker_mimi`, in which case nothing is checked.
+     * checkpoint has a separate speaker Mimi, otherwise `mimi.inner_dim` or `mimi.dimension`
+     * (`encoder_latent_dim` in xn-ptts).
      */
     val latentChannels: Int? = run {
-        val mimi = config.optJSONObject("speaker_mimi")?.optJSONObject("mimi") ?: return@run null
+        val mimi = config.optJSONObject("speaker_mimi")?.optJSONObject("mimi")
+            ?: config.optJSONObject("mimi")
+            ?: return@run null
         val inner = mimi.optInt("inner_dim", 0)
         if (inner > 0) inner else mimi.optInt("dimension", 0).takeIf { it > 0 }
     }
+
+    /** True when the checkpoint expects a `speaker_wavs` prefix sink (e.g. Cilla Lite `bos_before_voice`). */
+    val hasSpeakerSink: Boolean =
+        config.optJSONObject("prefix_sinks")?.has("speaker_wavs") == true
 
     /** Width of a precomputed voice embedding: the flow LM's `d_model`. */
     val embWidth: Int? = config.optJSONObject("flow_lm")

@@ -11,3 +11,7 @@ local.properties
 *.jks
 *.keystore
 keystore.properties
+
+# Native build work/cache directories
+native/.work/
+native/.cache/

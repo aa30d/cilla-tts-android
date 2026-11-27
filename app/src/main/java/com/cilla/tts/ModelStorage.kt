@@ -7,10 +7,13 @@ import java.io.File
 import java.io.FileOutputStream
 import java.util.Locale
 
-/** The two checkpoints the app can hold, each in its own folder under the app's files dir. */
+/** The checkpoints the app can hold, each in its own isolated folder under `filesDir`. */
 enum class ModelKind(val dirName: String, val label: String) {
-    PERSIAN("model", "فارسی"),
-    ENGLISH("model_en", "انگلیسی")
+    PERSIAN("model", "سیلا مینی (فارسی)"),
+    PERSIAN_LITE("model_lite", "سیلا لایت (فارسی)"),
+    ENGLISH("model_en", "فونون (انگلیسی)");
+
+    val isPersian: Boolean get() = this == PERSIAN || this == PERSIAN_LITE
 }
 
 /** What could be done with the voice files in a checkpoint folder. */
@@ -24,6 +27,7 @@ class VoiceReport(
 /** Outcome of copying a folder of voice files in. */
 class VoiceImportSummary(
     val persian: Int,
+    val persianLite: Int,
     val english: Int,
     val skipped: List<Pair<String, String>>
 )
@@ -31,29 +35,42 @@ class VoiceImportSummary(
 /**
  * The models, their voices and the app's storage rules.
  *
- * The two checkpoints live in `filesDir/model` and `filesDir/model_en` and never share a
- * `voices/` folder: Cilla's speaker projection takes 32 channels and Phonon's 512, so a voice in
- * the wrong folder makes `ptts_new` fail for the whole model ("has 512 channels but the speaker
- * projection take 32"). [prepare] keeps that from happening, and [importVoices] files a folder of
- * voices by asking each checkpoint's config which of them it can actually use.
+ * Each checkpoint lives in its own folder (`model` for Cilla Mini, `model_lite` for Cilla Lite,
+ * `model_en` for Phonon) and never shares a `voices/` folder: Cilla Mini has `d_model=512` and
+ * 32-channel latents, Cilla Lite has `d_model=1024` and 32-channel latents, and Phonon has
+ * `d_model=512` and 512-channel latents. [prepare] quarantines incompatible files into
+ * `voices_unsupported/` before `ptts_new` ever sees them.
  */
 object ModelStorage {
-    private const val CONFIG = "config.json"
-    private const val TOKENIZER = "tokenizer.json"
+    private const val CONFIG_JSON = "config.json"
+    private const val CONFIG_YAML = "config.yaml"
+    private const val TOKENIZER_JSON = "tokenizer.json"
+    private const val TOKENIZER_MODEL = "tokenizer.model"
     private const val DEFAULT_VOICE = "default-voice.safetensors"
 
     /** Every weight file the native loader accepts, in the order it tries them. */
     private val WEIGHTS = listOf("model.q8.gguf", "model.safetensors")
 
+    private val AUDIO_EXTENSIONS = setOf("wav", "mp3", "m4a", "ogg", "opus", "flac", "aac")
+
     fun modelDir(ctx: Context, kind: ModelKind): File = File(ctx.filesDir, kind.dirName)
 
     fun voicesDir(ctx: Context, kind: ModelKind): File = File(modelDir(ctx, kind), "voices")
+
+    fun promptsDir(ctx: Context, kind: ModelKind): File = File(modelDir(ctx, kind), "prompts")
 
     fun weights(dir: File): File? = WEIGHTS.map { File(dir, it) }.firstOrNull { it.isFile }
 
     /** The files `ptts_new` needs besides voices. */
     fun hasCoreFiles(dir: File): Boolean =
-        File(dir, CONFIG).isFile && File(dir, TOKENIZER).isFile && weights(dir) != null
+        File(dir, CONFIG_JSON).isFile && File(dir, TOKENIZER_JSON).isFile && weights(dir) != null
+
+    /** True when [kind] has its f32 safetensors weights with a Mimi speaker encoder. */
+    fun canCloneVoices(ctx: Context, kind: ModelKind): Boolean {
+        if (!kind.isPersian) return false
+        val dir = modelDir(ctx, kind)
+        return hasCoreFiles(dir) && File(dir, "model.safetensors").isFile
+    }
 
     /** Every voice file of a checkpoint, as the loader scans them: the safetensors in `voices/`, plus a root `default-voice.safetensors`. */
     fun voiceFiles(dir: File): List<File> {
@@ -70,8 +87,17 @@ object ModelStorage {
         if (it.name == DEFAULT_VOICE) "default" else it.name.removeSuffix(".safetensors")
     }
 
+    fun voiceNames(ctx: Context, kind: ModelKind): List<String> = voiceNames(modelDir(ctx, kind))
+
     /** Core files and at least one voice: enough to load and speak. */
     fun isReady(dir: File): Boolean = hasCoreFiles(dir) && voiceFiles(dir).isNotEmpty()
+
+    fun isReady(ctx: Context, kind: ModelKind): Boolean = isReady(modelDir(ctx, kind))
+
+    fun hasCoreFiles(ctx: Context, kind: ModelKind): Boolean = hasCoreFiles(modelDir(ctx, kind))
+
+    fun prepare(ctx: Context, kind: ModelKind, quarantine: Boolean = true): VoiceReport =
+        prepare(modelDir(ctx, kind), quarantine)
 
     /**
      * Checks every voice file against the checkpoint's config and, when [quarantine] is set,
@@ -101,30 +127,61 @@ object ModelStorage {
         return VoiceReport(usable, unsupported)
     }
 
-    /** Copies a checkpoint folder picked through the storage picker into the app's files. */
+    /**
+     * Copies a checkpoint folder picked through SAF into the app's internal storage.
+     *
+     * Supports both already-converted `xn-ptts` folders (`config.json` + `tokenizer.json`) AND
+     * raw Hugging Face `mehdi-hf/cilla-lite` folders (`config.yaml` + `tokenizer.model` +
+     * optional `prompts/` WAV files), converting config, tokenizer, and prompt WAVs automatically.
+     */
     fun importModel(ctx: Context, kind: ModelKind, treeUri: Uri, onStatus: (String) -> Unit): VoiceReport {
         val root = DocumentFile.fromTreeUri(ctx, treeUri)
             ?: throw IllegalStateException("دسترسی به پوشه امکان‌پذیر نیست")
-        val configDoc = root.findFile(CONFIG)
-            ?: throw IllegalStateException("فایل config.json در پوشه یافت نشد")
-        val tokenizerDoc = root.findFile(TOKENIZER)
-            ?: throw IllegalStateException("فایل tokenizer.json در پوشه یافت نشد")
-        // Phonon ships a GGUF; Cilla only publishes safetensors.
-        val weightName = WEIGHTS.firstOrNull { root.findFile(it) != null }
+
+        val configJsonDoc = root.findFile(CONFIG_JSON)?.takeIf { it.isFile }
+        val configYamlDoc = root.findFile(CONFIG_YAML)?.takeIf { it.isFile }
+        if (configJsonDoc == null && configYamlDoc == null) {
+            throw IllegalStateException("فایل config.json یا config.yaml در پوشه یافت نشد")
+        }
+
+        val tokJsonDoc = root.findFile(TOKENIZER_JSON)?.takeIf { it.isFile }
+        val tokModelDoc = root.findFile(TOKENIZER_MODEL)?.takeIf { it.isFile }
+        if (tokJsonDoc == null && tokModelDoc == null) {
+            throw IllegalStateException("فایل tokenizer.json یا tokenizer.model در پوشه یافت نشد")
+        }
+
+        val weightName = WEIGHTS.firstOrNull { root.findFile(it)?.isFile == true }
             ?: throw IllegalStateException("فایل وزن مدل (model.safetensors یا model.q8.gguf) در پوشه یافت نشد")
         val weightDoc = root.findFile(weightName)!!
 
         val target = modelDir(ctx, kind)
         val voices = File(target, "voices")
+        val prompts = File(target, "prompts")
         target.mkdirs()
         voices.mkdirs()
 
-        onStatus("در حال کپی config.json...")
-        copyDoc(ctx, configDoc, File(target, CONFIG))
-        onStatus("در حال کپی tokenizer.json...")
-        copyDoc(ctx, tokenizerDoc, File(target, TOKENIZER))
         onStatus("در حال کپی $weightName...")
         copyDoc(ctx, weightDoc, File(target, weightName))
+
+        if (configJsonDoc != null) {
+            onStatus("در حال کپی config.json...")
+            copyDoc(ctx, configJsonDoc, File(target, CONFIG_JSON))
+        } else {
+            val yamlFile = File(target, CONFIG_YAML)
+            onStatus("در حال کپی و تبدیل config.yaml...")
+            copyDoc(ctx, configYamlDoc!!, yamlFile)
+            CillaLiteConverter.convertFile(yamlFile, File(target, CONFIG_JSON))
+        }
+
+        if (tokJsonDoc != null) {
+            onStatus("در حال کپی tokenizer.json...")
+            copyDoc(ctx, tokJsonDoc, File(target, TOKENIZER_JSON))
+        } else {
+            val spmFile = File(target, TOKENIZER_MODEL)
+            onStatus("در حال تبدیل tokenizer.model به tokenizer.json...")
+            copyDoc(ctx, tokModelDoc!!, spmFile)
+            SentencePieceConverter.convertFile(spmFile, File(target, TOKENIZER_JSON))
+        }
 
         val rootVoice = root.findFile(DEFAULT_VOICE)?.takeIf { it.isFile }
         if (rootVoice != null) {
@@ -141,14 +198,133 @@ object ModelStorage {
             copyDoc(ctx, doc, File(voices, name))
         }
 
+        // Copy and encode reference audio prompts (e.g. cilla-lite's prompts/voice1.wav, voice2.wav).
+        val promptsDoc = root.findFile("prompts")?.takeIf { it.isDirectory }
+        val promptAudioDocs = promptsDoc?.listFiles()?.filter { doc ->
+            val ext = doc.name?.substringAfterLast('.', "")?.lowercase().orEmpty()
+            doc.isFile && ext in AUDIO_EXTENSIONS
+        } ?: emptyList()
+
+        if (promptAudioDocs.isNotEmpty()) {
+            prompts.mkdirs()
+            for (doc in promptAudioDocs) {
+                val fileName = doc.name ?: continue
+                val destPrompt = File(prompts, fileName)
+                onStatus("در حال کپی فایل نمونه $fileName...")
+                copyDoc(ctx, doc, destPrompt)
+                val stem = sanitizeVoiceName(fileName.substringBeforeLast('.'))
+                val voiceOut = File(voices, "$stem.safetensors")
+                if (!voiceOut.isFile && PhononTTS.hasVoiceCloningFfi && File(target, "model.safetensors").isFile) {
+                    onStatus("در حال ساخت بردار صدای $stem...")
+                    try {
+                        val pcm = AudioDecoder.decodeFileToMono24k(destPrompt)
+                        PhononTTS.cloneVoiceToFile(
+                            modelDir = target,
+                            pcm = pcm,
+                            sampleRate = AudioDecoder.TARGET_SAMPLE_RATE,
+                            outputFile = voiceOut,
+                            normalizeLoudness = false
+                        )
+                    } catch (_: Exception) {
+                        // Keep the copied prompt file; user can retry or inspect error when cloning.
+                    }
+                }
+            }
+        }
+
         val report = prepare(target)
-        if (report.usable.isEmpty()) {
+        if (report.usable.isEmpty() && kind != ModelKind.PERSIAN_LITE) {
             throw IllegalStateException(
                 "هیچ گوینده سازگاری با مدل ${kind.label} پیدا نشد" +
                     report.unsupported.firstOrNull()?.let { " (${it.first}: ${it.second})" }.orEmpty()
             )
         }
         return report
+    }
+
+    /**
+     * Encode any copied prompt audio files in `prompts/` that do not yet have a corresponding
+     * `.safetensors` voice in `voices/`.
+     */
+    fun encodePendingPrompts(ctx: Context, kind: ModelKind, onStatus: (String) -> Unit): Int {
+        val dir = modelDir(ctx, kind)
+        val prompts = promptsDir(ctx, kind)
+        val voices = voicesDir(ctx, kind).apply { mkdirs() }
+        if (!prompts.isDirectory || !File(dir, "model.safetensors").isFile) return 0
+
+        var created = 0
+        val audioFiles = prompts.listFiles()?.filter { f ->
+            f.isFile && f.extension.lowercase() in AUDIO_EXTENSIONS
+        }?.sortedBy { it.name } ?: emptyList()
+
+        for (file in audioFiles) {
+            val stem = sanitizeVoiceName(file.nameWithoutExtension)
+            val out = File(voices, "$stem.safetensors")
+            if (out.isFile) continue
+            onStatus("در حال استخراج صدای $stem...")
+            val pcm = AudioDecoder.decodeFileToMono24k(file)
+            PhononTTS.cloneVoiceToFile(
+                modelDir = dir,
+                pcm = pcm,
+                sampleRate = AudioDecoder.TARGET_SAMPLE_RATE,
+                outputFile = out,
+                normalizeLoudness = false
+            )
+            created++
+        }
+        if (created > 0) prepare(dir)
+        return created
+    }
+
+    /**
+     * Clones a voice from 24 kHz mono float PCM into [kind]'s `voices/` directory and validates it.
+     * Returns `(voiceName, savedFile)`.
+     */
+    fun cloneVoiceFromPcm(
+        ctx: Context,
+        kind: ModelKind,
+        rawName: String,
+        pcm: FloatArray
+    ): Pair<String, File> {
+        val dir = modelDir(ctx, kind)
+        if (!canCloneVoices(ctx, kind)) {
+            throw IllegalStateException("مدل ${kind.label} از کلون صدا پشتیبانی نمی‌کند یا فایل model.safetensors ندارد")
+        }
+        val safeName = sanitizeVoiceName(rawName)
+        val validated = AudioDecoder.validateAndTrimPrompt(pcm, AudioDecoder.TARGET_SAMPLE_RATE)
+        val voices = voicesDir(ctx, kind).apply { mkdirs() }
+        val out = File(voices, "$safeName.safetensors")
+        PhononTTS.cloneVoiceToFile(
+            modelDir = dir,
+            pcm = validated,
+            sampleRate = AudioDecoder.TARGET_SAMPLE_RATE,
+            outputFile = out,
+            normalizeLoudness = false
+        )
+        val report = prepare(dir)
+        if (!out.isFile) {
+            val reason = report.unsupported.firstOrNull { it.first == out.name }?.second
+            throw IllegalStateException("صدای ساخته‌شده معتبر نبود" + reason?.let { ": $it" }.orEmpty())
+        }
+        return safeName to out
+    }
+
+    fun cloneVoiceFromUri(
+        ctx: Context,
+        kind: ModelKind,
+        rawName: String,
+        audioUri: Uri
+    ): Pair<String, File> {
+        val pcm = AudioDecoder.decodeUriToMono24k(ctx, audioUri)
+        return cloneVoiceFromPcm(ctx, kind, rawName, pcm)
+    }
+
+    fun sanitizeVoiceName(raw: String): String {
+        val trimmed = raw.trim()
+            .replace(Regex("[/\\\\:*?\"<>|.]"), "_")
+            .replace(Regex("\\s+"), "_")
+            .trim('_')
+        return trimmed.ifEmpty { "cloned_${System.currentTimeMillis() % 10000}" }
     }
 
     private fun copyDoc(ctx: Context, doc: DocumentFile, dest: File) {
@@ -161,9 +337,7 @@ object ModelStorage {
     }
 
     /**
-     * Copies every `.safetensors` in the picked folder into the checkpoint whose config can use
-     * it. This is the safe way to add voices: a Phonon voice (512 channels) can no longer land in
-     * `model/voices` and break the Persian model.
+     * Copies every `.safetensors` in the picked folder into the checkpoint whose config can use it.
      */
     fun importVoices(ctx: Context, treeUri: Uri, onStatus: (String) -> Unit): VoiceImportSummary {
         val root = DocumentFile.fromTreeUri(ctx, treeUri)
@@ -174,7 +348,7 @@ object ModelStorage {
             ModelProfile.load(dir)?.let { profiles[kind] = it }
         }
         if (profiles.isEmpty()) {
-            throw IllegalStateException("ابتدا مدل فارسی یا انگلیسی را نصب کنید، بعد پوشه صدا را انتخاب کنید")
+            throw IllegalStateException("ابتدا حداقل یک مدل را نصب کنید، بعد پوشه صدا را انتخاب کنید")
         }
         val sources = collectVoiceDocs(root)
         if (sources.isEmpty()) {
@@ -185,6 +359,7 @@ object ModelStorage {
             mkdirs()
         }
         var persian = 0
+        var persianLite = 0
         var english = 0
         val skipped = mutableListOf<Pair<String, String>>()
         try {
@@ -215,6 +390,7 @@ object ModelStorage {
                     }
                     when (kind) {
                         ModelKind.PERSIAN -> persian++
+                        ModelKind.PERSIAN_LITE -> persianLite++
                         ModelKind.ENGLISH -> english++
                     }
                 }
@@ -225,15 +401,9 @@ object ModelStorage {
         for (kind in ModelKind.entries) {
             if (profiles.containsKey(kind)) prepare(modelDir(ctx, kind))
         }
-        return VoiceImportSummary(persian, english, skipped)
+        return VoiceImportSummary(persian, persianLite, english, skipped)
     }
 
-    /**
-     * A voice both checkpoints accept -- an `audio_prompt`/`emb` file is 512 wide, which is the
-     * flow LM width of both -- goes where its metadata says, and otherwise to Cilla: the Persian
-     * voices published for the demo carry no metadata at all, while Phonon voices name their
-     * checkpoint. Latent files never reach here: their channel count picks the model outright.
-     */
     private fun pickKind(
         info: VoiceFileInfo,
         usable: Set<ModelKind>,
@@ -243,10 +413,14 @@ object ModelStorage {
         if (modelExt != null) {
             usable.firstOrNull { profiles[it]?.embeddingsExt?.contains(modelExt) == true }?.let { return it }
         }
-        return if (ModelKind.PERSIAN in usable) ModelKind.PERSIAN else usable.first()
+        // `emb` width 1024 only matches PERSIAN_LITE; 512 matches PERSIAN or ENGLISH.
+        if (ModelKind.PERSIAN_LITE in usable && info.width == 1024) return ModelKind.PERSIAN_LITE
+        if (ModelKind.PERSIAN in usable) return ModelKind.PERSIAN
+        if (ModelKind.PERSIAN_LITE in usable) return ModelKind.PERSIAN_LITE
+        return usable.first()
     }
 
-    /** Every `.safetensors` under [root], one folder deep, which is how voice folders are shipped. */
+    /** Every `.safetensors` under [root], one folder deep. */
     private fun collectVoiceDocs(root: DocumentFile): List<DocumentFile> {
         val result = mutableListOf<DocumentFile>()
         for (child in root.listFiles()) {
@@ -273,7 +447,22 @@ object ModelStorage {
         source.delete()
     }
 
-    /** Removes every voice file, keeping the models. Returns how many files went. */
+    /** Deletes a single voice from [kind]. Returns true if removed. */
+    fun deleteVoice(ctx: Context, kind: ModelKind, voiceName: String): Boolean {
+        val dir = modelDir(ctx, kind)
+        val file = if (voiceName == "default") {
+            File(dir, DEFAULT_VOICE)
+        } else {
+            File(File(dir, "voices"), "$voiceName.safetensors")
+        }
+        val deleted = file.delete()
+        if (deleted && TtsPrefs.getVoice(ctx, kind) == voiceName) {
+            TtsPrefs.clearVoice(ctx, kind)
+        }
+        return deleted
+    }
+
+    /** Removes every voice file across all models, keeping the models. Returns how many files went. */
     fun deleteVoices(ctx: Context): Int {
         var removed = 0
         for (kind in ModelKind.entries) {
@@ -289,7 +478,13 @@ object ModelStorage {
         return removed
     }
 
-    /** Removes both checkpoints and their voices from the app's internal storage. */
+    /** Removes a single checkpoint and its voices. */
+    fun deleteModel(ctx: Context, kind: ModelKind) {
+        modelDir(ctx, kind).deleteRecursively()
+        TtsPrefs.clearVoice(ctx, kind)
+    }
+
+    /** Removes all checkpoints and their voices from the app's internal storage. */
     fun deleteModels(ctx: Context) {
         for (kind in ModelKind.entries) {
             modelDir(ctx, kind).deleteRecursively()
