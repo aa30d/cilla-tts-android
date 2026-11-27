@@ -90,22 +90,44 @@ class TtsEngines(context: Context) : AutoCloseable {
     val persianFailure: String? get() = persianError
     val englishFailure: String? get() = englishError
 
+    /** The last reason a freshly cloned voice could not be registered on a live engine. */
+    @Volatile
+    var lastRegistrationFailure: String? = null
+        private set
+
     /**
-     * Registers a newly cloned voice on the already-loaded engine if possible (zero reload),
-     * or closes the engine so the next call loads it cleanly.
+     * Registers a newly cloned voice on the already-loaded engine, or closes the engine so the
+     * next call loads it cleanly with the file in `voices/`.
+     *
+     * Registration can fail for a real reason -- `Synth::add_voice_file` refuses a checkpoint with
+     * baked-in voices once guidance is on, and refuses a file whose width does not match -- so the
+     * message is kept in [lastRegistrationFailure] instead of being swallowed: the voice still works
+     * after the reload, but a silent `close()` would have looked like the app losing it.
+     *
+     * @return true when the voice is usable right now (registered, or reloaded on next use);
+     * false when it was registered on no engine, in which case nothing needed doing.
      */
     @Synchronized
-    fun registerVoiceFile(kind: ModelKind, voiceName: String, voiceFile: File) {
+    fun registerVoiceFile(kind: ModelKind, voiceName: String, voiceFile: File): Boolean {
+        lastRegistrationFailure = null
         val loaded = when (kind) {
             ModelKind.ENGLISH -> english
             else -> if (persianKindLoaded == kind) persian else null
-        } ?: return
-        try {
-            if (!loaded.addVoiceFile(voiceName, voiceFile)) {
+        } ?: return false
+        return try {
+            if (loaded.addVoiceFile(voiceName, voiceFile)) {
+                true
+            } else {
+                lastRegistrationFailure = "کتابخانه بومی این نسخه از افزودن صدا به مدل بارگذاری‌شده پشتیبانی نمی‌کند"
                 close(kind)
+                true
             }
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            // Reloading picks the file up from `voices/`, which is why this is not fatal -- but say
+            // so, because a reload of a 440 MB checkpoint is worth explaining.
+            lastRegistrationFailure = e.message ?: "افزودن صدا به مدل بارگذاری‌شده ناموفق بود"
             close(kind)
+            true
         }
     }
 
@@ -164,26 +186,39 @@ class TtsEngines(context: Context) : AutoCloseable {
                 val engine = persianOrNull(faKind)
                     ?: throw IllegalStateException(persianError ?: "مدل فارسی در دسترس نیست")
                 configure(engine, faKind, temperature, seed)
-                val countTokens: (String) -> Int = { s ->
-                    engine.countTokens(s) ?: PersianFrontend.estimateTokens(s)
-                }
-                val chunks = PersianFrontend.splitSentences(
-                    PersianFrontend.withEnd(segment.text),
-                    countTokens,
-                    maxTokens = PersianFrontend.MAX_TOKENS,
-                    minTokens = PersianFrontend.MIN_TOKENS
-                )
-                val framesAfterEos = if (faKind == ModelKind.PERSIAN_LITE) 0 else 1
-
-                for (chunk in chunks) {
-                    if (stopped) break
-                    if (emittedAny && !guardedSink(pauseSilence)) break
-                    last = if (exactPostProcess) {
-                        speakPersianBuffered(engine, chunk, framesAfterEos, seed, countTokens, guardedSink)
-                    } else {
-                        speakPersianStreaming(engine, chunk, framesAfterEos, guardedSink)
+                if (faKind == ModelKind.PERSIAN) {
+                    // Cilla Mini predates the Cilla Lite frontend and was tuned against the
+                    // runtime's own text path: one segment at a time, `ptts_speak` with its
+                    // `prepare_text_prompt` (which picks three frames after EOS for short text).
+                    // Keeping that here means adding Cilla Lite does not change Mini's audio.
+                    for (chunk in TextCleaner.chunkPersian(segment.text)) {
+                        if (stopped) break
+                        if (emittedAny && !guardedSink(pauseSilence)) break
+                        last = engine.speak(chunk, guardedSink)
+                        emittedAny = true
                     }
-                    emittedAny = true
+                } else {
+                    val countTokens: (String) -> Int = { s ->
+                        engine.countTokens(s) ?: PersianFrontend.estimateTokens(s)
+                    }
+                    val chunks = PersianFrontend.splitSentences(
+                        PersianFrontend.withEnd(segment.text),
+                        countTokens,
+                        maxTokens = PersianFrontend.MAX_TOKENS,
+                        minTokens = PersianFrontend.MIN_TOKENS
+                    )
+                    val framesAfterEos = 0
+
+                    for (chunk in chunks) {
+                        if (stopped) break
+                        if (emittedAny && !guardedSink(pauseSilence)) break
+                        last = if (exactPostProcess) {
+                            speakPersianBuffered(engine, chunk, framesAfterEos, seed, countTokens, guardedSink)
+                        } else {
+                            speakPersianStreaming(engine, chunk, framesAfterEos, guardedSink)
+                        }
+                        emittedAny = true
+                    }
                 }
             }
         }

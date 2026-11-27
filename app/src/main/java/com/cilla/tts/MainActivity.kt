@@ -113,7 +113,14 @@ class MainActivity : AppCompatActivity() {
 
         refreshModelState()
         updatePlayButton()
-        if (!engines.hasAnyPersianModel() && !engines.hasEnglishModel()) {
+        val missingNative = PhononTTS.missingFfiFeatures
+        if (missingNative.isNotEmpty()) {
+            setStatus(
+                "کتابخانه بومی این APK با این نسخه از برنامه هم‌خوان نیست " +
+                    "(نمادهای ناموجود: ${missingNative.joinToString()}). " +
+                    "APK را با native/build-ptts-ffi.sh یا از GitHub Actions بسازید."
+            )
+        } else if (!engines.hasAnyPersianModel() && !engines.hasEnglishModel()) {
             setStatus("مدلی نصب نیست. از تب «تنظیمات» سیلا مینی، سیلا لایت یا مدل انگلیسی را نصب کنید.")
         }
     }
@@ -534,7 +541,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun showPhononVoicesDialog(entries: List<PhononVoiceEntry>) {
-        val installed = PhononVoicesCatalog.installedStems(this)
+        val installed = PhononVoicesCatalog.installedFileNames(this)
         val selectedIds = LinkedHashSet<String>()
         var activeFilter = "all"
 
@@ -573,7 +580,7 @@ class MainActivity : AppCompatActivity() {
         fun rebuildList() {
             listContainer.removeAllViews()
             for (entry in visibleEntries()) {
-                val alreadyInstalled = entry.safeStem.lowercase() in installed
+                val alreadyInstalled = PhononVoicesCatalog.isInstalled(entry, installed)
                 val row = LinearLayout(this).apply {
                     orientation = LinearLayout.VERTICAL
                     setPadding(0, dp(4), 0, dp(6))
@@ -697,7 +704,7 @@ class MainActivity : AppCompatActivity() {
         if (busy) return
         val target = resolveCloneTarget()
         if (target == null) {
-            setStatus("ابتدا مدل سیلا لایت یا سیلا مینی را نصب کنید تا بتوانید صدا کلون کنید.")
+            setStatus(cloneUnavailableStatus())
             return
         }
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) !=
@@ -713,10 +720,23 @@ class MainActivity : AppCompatActivity() {
     private fun requestPickCloneAudio() {
         if (busy) return
         if (resolveCloneTarget() == null) {
-            setStatus("ابتدا مدل سیلا لایت یا سیلا مینی را نصب کنید تا بتوانید صدا کلون کنید.")
+            setStatus(cloneUnavailableStatus())
             return
         }
         pickCloneAudio.launch(arrayOf("audio/*"))
+    }
+
+    /** The most specific reason cloning cannot start, for the status line. */
+    private fun cloneUnavailableStatus(): String {
+        for (kind in ModelKind.entries.filter { it.isPersian }) {
+            val reason = ModelStorage.cloneUnavailableReason(this, kind)
+            if (reason != null && ModelStorage.hasCoreFiles(this, kind)) return reason
+        }
+        if (!PhononTTS.hasVoicePromptFfi) {
+            return ModelStorage.cloneUnavailableReason(this, ModelKind.PERSIAN)
+                ?: "کتابخانه بومی نسخه کلون صدا را ندارد."
+        }
+        return "ابتدا مدل سیلا لایت یا سیلا مینی را نصب کنید تا بتوانید صدا کلون کنید."
     }
 
     private fun showRecordCloneDialog(defaultTarget: ModelKind) {
@@ -907,10 +927,7 @@ class MainActivity : AppCompatActivity() {
         stopSpeaking()
         runTask("در حال ساخت گوینده کلون‌شده برای ${target.label}...") {
             val (voiceName, voiceFile) = ModelStorage.cloneVoiceFromPcm(this, target, rawName, pcm)
-            engines.registerVoiceFile(target, voiceName, voiceFile)
-            TtsPrefs.setVoice(this, target, voiceName)
-            TtsPrefs.setActivePersianKind(this, target)
-            "گوینده «$voiceName» با موفقیت برای ${target.label} ساخته و فعال شد."
+            finishClone(target, voiceName, voiceFile)
         }
     }
 
@@ -919,10 +936,26 @@ class MainActivity : AppCompatActivity() {
         stopSpeaking()
         runTask("در حال تبدیل فایل صوتی و ساخت گوینده برای ${target.label}...") {
             val (voiceName, voiceFile) = ModelStorage.cloneVoiceFromUri(this, target, rawName, uri)
-            engines.registerVoiceFile(target, voiceName, voiceFile)
-            TtsPrefs.setVoice(this, target, voiceName)
-            TtsPrefs.setActivePersianKind(this, target)
-            "گوینده «$voiceName» با موفقیت برای ${target.label} ساخته و فعال شد."
+            finishClone(target, voiceName, voiceFile)
+        }
+    }
+
+    /**
+     * Select the new voice and hand it to the live engine. Registration can legitimately fail on a
+     * loaded checkpoint (baked-in voices refuse `add_voice_file`), in which case the engine has
+     * been closed and the voice is picked up by the next load: say so instead of reporting a plain
+     * success, because that reload is what the user will notice as a delay.
+     */
+    private fun finishClone(target: ModelKind, voiceName: String, voiceFile: File): String {
+        engines.registerVoiceFile(target, voiceName, voiceFile)
+        TtsPrefs.setVoice(this, target, voiceName)
+        TtsPrefs.setActivePersianKind(this, target)
+        val note = engines.lastRegistrationFailure
+        val base = "گوینده «$voiceName» با موفقیت برای ${target.label} ساخته و فعال شد."
+        return if (note.isNullOrBlank()) {
+            base
+        } else {
+            "$base (مدل برای استفاده از آن دوباره بارگذاری می‌شود: $note)"
         }
     }
 
@@ -1121,9 +1154,13 @@ class MainActivity : AppCompatActivity() {
     private fun updateCloneSection() {
         val target = resolveCloneTarget()
         binding.cloneStatusText.text = if (target != null) {
-            "مدل هدف کلون صدا: ${target.label} — با ضبط ۳ تا ۱۰ ثانیه یا انتخاب فایل صوتی، گوینده جدید بسازید."
+            val (minSeconds, maxSeconds) = ModelStorage.promptDurationBounds(this, target)
+            val range = if (maxSeconds > 10f) "۳ تا ۱۰" else "۳ تا ${maxSeconds.toInt()}"
+            "مدل هدف کلون صدا: ${target.label} — $range ثانیه صحبت کنید یا فایل صوتی بدهید " +
+                "(حداقل ${minSeconds.toInt()} ثانیه)."
         } else {
-            "برای کلون صدا، ابتدا سیلا لایت یا سیلا مینی را نصب کنید."
+            // Say which model is missing what, rather than a generic "install a model".
+            cloneUnavailableStatus()
         }
     }
 

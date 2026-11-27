@@ -11,10 +11,10 @@ index 06fbd68..6eec7ef 100644
  [target.'cfg(target_vendor = "apple")'.dependencies]
  ptts-coreml = { path = "../ptts-coreml" }
 diff --git a/ptts-ffi/include/ptts.h b/ptts-ffi/include/ptts.h
-index ae00d1c..4dbb3dc 100644
+index ae00d1c..2331a04 100644
 --- a/ptts-ffi/include/ptts.h
 +++ b/ptts-ffi/include/ptts.h
-@@ -51,4 +51,33 @@ void ptts_set_seed(PttsHandle *h, uint64_t seed);
+@@ -51,4 +51,56 @@ void ptts_set_seed(PttsHandle *h, uint64_t seed);
  const char *ptts_last_error(const PttsHandle *h);
  void ptts_free(PttsHandle *h);
  
@@ -37,19 +37,42 @@ index ae00d1c..4dbb3dc 100644
 +bool ptts_add_voice_file(PttsHandle *h, const char *name, const char *path);
 +/// Encode mono f32 PCM at `sample_rate` Hz using the checkpoint's speaker encoder and write
 +/// the resulting `"emb"` `.safetensors` voice file to `output_path`. On failure returns false
-+/// and sets `ptts_last_error(NULL)` on the calling thread.
++/// and sets `ptts_last_error(NULL)` on the calling thread. When `frames`/`dim` are given they
++/// receive the embedding's frame count and width (the checkpoint's `flow_lm.d_model`).
 +bool ptts_clone_voice_to_file(
 +    const char *model_dir,
 +    const float *pcm,
 +    size_t n_samples,
 +    uint32_t sample_rate,
 +    const char *output_path,
-+    bool normalize_loudness
++    bool normalize_loudness,
++    uint32_t *frames,
++    uint32_t *dim
 +);
-+
++/// Clone several voices in one call, so the checkpoint's weights are loaded once for the batch.
++/// `names` holds `count` NUL-terminated voice names; their samples are in `pcm`, back to back,
++/// the i-th from `offsets[i]` to `offsets[i + 1]` (`offsets` has `count + 1` entries), all at the
++/// checkpoint's prompt sample rate. Writes `<name>.safetensors` per voice into `voices_dir`.
++/// On success returns true with `*written` set, and `failed` (when not NULL) receiving a
++/// NUL-separated, NUL-terminated list of the names that could not be encoded; free it with
++/// `ptts_strings_free`. Returns false, with `ptts_last_error(NULL)` set, only when the batch
++/// cannot be attempted at all.
++bool ptts_clone_voices_to_dir(
++    const char *model_dir,
++    const char *voices_dir,
++    const char *const *names,
++    size_t count,
++    const float *pcm,
++    const size_t *offsets,
++    bool normalize_loudness,
++    uint32_t *written,
++    char **failed
++);
++/// Free a string `ptts_clone_voices_to_dir` returned.
++void ptts_strings_free(char *s);
  #endif
 diff --git a/ptts-ffi/src/cpu.rs b/ptts-ffi/src/cpu.rs
-index d250337..fc96bab 100644
+index d250337..ce2c02e 100644
 --- a/ptts-ffi/src/cpu.rs
 +++ b/ptts-ffi/src/cpu.rs
 @@ -6,10 +6,15 @@
@@ -122,7 +145,7 @@ index d250337..fc96bab 100644
      /// Switch to one of [`Self::voices`].
      pub fn set_voice(&mut self, name: &str) -> Result<(), String> {
          self.voice = Some(name.to_string());
-@@ -132,6 +158,130 @@ impl Engine {
+@@ -132,6 +158,238 @@ impl Engine {
              total_ms: start.elapsed().as_secs_f64() * 1e3,
          })
      }
@@ -185,51 +208,72 @@ index d250337..fc96bab 100644
 +    }
 +}
 +
-+/// Encode mono f32 PCM with the checkpoint's speaker encoder and save an `"emb"` safetensors file.
-+pub fn clone_voice_to_file(
++/// What a cloned voice file holds: the embedding's frames and width, so the caller can check the
++/// file against the checkpoint without reading it back.
++#[derive(Clone, Copy, Debug, Default)]
++pub struct CloneInfo {
++    pub frames: usize,
++    pub dim: usize,
++}
++
++/// The checkpoint's speaker encoder, for cloning voices from audio.
++fn load_speaker_encoder(
 +    model_dir: &Path,
-+    pcm: &[f32],
-+    sample_rate: u32,
-+    output_path: &Path,
-+    normalize_loudness: bool,
-+) -> Result<(), String> {
-+    let config = model_dir.join("config.json");
-+    let cfg = read_config(&config).map_err(|e| e.to_string())?;
-+    let speaker_sr = cfg.speaker_mimi_cfg().sample_rate as u32;
-+    if sample_rate != speaker_sr {
-+        return Err(format!(
-+            "voice prompt sample rate is {sample_rate} Hz, expected {speaker_sr} Hz"
-+        ));
-+    }
-+    let min_dur = cfg.audio_prompt_min_duration.min(1.0).max(0.5);
-+    let max_dur = cfg.audio_prompt_max_duration.max(15.0).min(30.0);
-+    let min_len = (speaker_sr as f32 * min_dur).round() as usize;
-+    let max_len = (speaker_sr as f32 * max_dur).round() as usize;
-+    if pcm.len() < min_len {
-+        return Err(format!(
-+            "voice prompt is too short: got {:.2}s, need at least {:.2}s",
-+            pcm.len() as f32 / speaker_sr as f32,
-+            min_dur
-+        ));
-+    }
-+    let mut pcm = pcm[..pcm.len().min(max_len)].to_vec();
-+    if normalize_loudness {
-+        ptts::utils::normalize_loudness(&mut pcm, speaker_sr).map_err(|e| e.to_string())?;
-+    }
++    cfg: &ptts::tts_model::TTSConfig,
++) -> Result<MimiEnc<xn::Unquantized<f32, xn::CpuDevice>>, String> {
 +    // Prefer f32 safetensors because quantized GGUFs typically omit the speaker encoder.
-+    let weights = ["model.safetensors", "model.q8.gguf"]
++    let weights_path = ["model.safetensors", "model.q8.gguf"]
 +        .iter()
 +        .map(|name| model_dir.join(name))
 +        .find(|p| p.is_file())
 +        .ok_or_else(|| format!("no weights in {}", model_dir.display()))?;
 +    let dev = xn::CpuDevice;
-+    let vb = ptts::loader::load_weights::<xn::Unquantized<f32, xn::CpuDevice>>(&weights, &dev)
++    let vb = ptts::loader::load_weights::<xn::Unquantized<f32, xn::CpuDevice>>(&weights_path, &dev)
 +        .map_err(|e| e.to_string())?;
-+    let mimi_enc: MimiEnc<xn::Unquantized<f32, xn::CpuDevice>> =
-+        MimiEnc::load(&vb, &cfg).map_err(|e| e.to_string())?;
-+    let pcm_tensor = xn::Tensor::from_vec(pcm, (1, 1, ()), &dev).map_err(|e| e.to_string())?;
-+    let emb = mimi_enc.encode_audio(&pcm_tensor).map_err(|e| e.to_string())?;
-+    let tensors = HashMap::from([("emb".to_string(), xn::TypedTensor::F32(emb))]);
++    // `Synth::prime` requires this weight, so check for it before the encoder reports some other,
++    // more confusing error (`MimiEnc::load` already says so, but only after loading the encoder).
++    if !vb.contains(ptts::loader::SPEAKER_PROJ_WEIGHT) {
++        return Err(format!(
++            "{} has no speaker projection ({}): this checkpoint can speak but cannot clone a \
++             voice. A GGUF written with `quantize --no-mimi-encoder` is the usual cause.",
++            weights_path.display(),
++            ptts::loader::SPEAKER_PROJ_WEIGHT
++        ));
++    }
++    let enc = MimiEnc::load(&vb, cfg).map_err(|e| e.to_string())?;
++    drop(vb);
++    Ok(enc)
++}
++
++/// Encode one prompt and write it as a voice file.
++///
++/// When the checkpoint's guidance null branch is conditioned on silence (`cfg_null_audio_empty`
++/// is false), the encoding of the same-length silence is written too, as `null_emb`: a voice file
++/// without it cannot be used for guided generation on such a checkpoint (`Synth::prime` refuses).
++/// Both tensors are f32, which is what `loader::load_voice_emb` reads them as.
++fn write_voice_file(
++    cfg: &ptts::tts_model::TTSConfig,
++    enc: &MimiEnc<xn::Unquantized<f32, xn::CpuDevice>>,
++    pcm: &[f32],
++    output_path: &Path,
++) -> Result<CloneInfo, String> {
++    let dev = xn::CpuDevice;
++    let pcm_tensor =
++        xn::Tensor::from_vec(pcm.to_vec(), (1, 1, ()), &dev).map_err(|e| e.to_string())?;
++    let emb = enc.encode_audio(&pcm_tensor).map_err(|e| e.to_string())?;
++    let mut tensors = HashMap::from([("emb".to_string(), xn::TypedTensor::F32(emb))]);
++    let frames = match tensors.get("emb") {
++        Some(xn::TypedTensor::F32(t)) => t.dims3().map_err(|e| e.to_string())?.1,
++        _ => return Err("speaker encoder returned no embedding".to_string()),
++    };
++    if !cfg.cfg_null_audio_empty {
++        let silent = pcm_tensor.zeros_like().map_err(|e| e.to_string())?;
++        let null_emb = enc.encode_audio(&silent).map_err(|e| e.to_string())?;
++        tensors.insert("null_emb".to_string(), xn::TypedTensor::F32(null_emb));
++    }
++    // `model_ext` tags the file with the checkpoint that made it; `loader::check_model_ext` then
++    // refuses it in a checkpoint listed under another `embeddings_ext`. A config with no
++    // `model_id` (pocket-tts ones, before CillaLiteConverter adds one) has no tag to write.
 +    let data_info = cfg
 +        .model_ext()
 +        .map(|ext| HashMap::from([("model_ext".to_string(), ext)]));
@@ -249,15 +293,102 @@ index d250337..fc96bab 100644
 +        let _ = std::fs::remove_file(&tmp_path);
 +        return Err(e.to_string());
 +    }
-+    Ok(())
++    Ok(CloneInfo { frames, dim: cfg.flow_lm.d_model })
++}
++
++/// Check a prompt's length against the checkpoint's bounds and trim it to the maximum, as
++/// `Synth::add_voice_from_pcm` does. The caller normalizes loudness beforehand.
++fn prompt_samples(
++    cfg: &ptts::tts_model::TTSConfig,
++    pcm: &[f32],
++    speaker_sr: u32,
++) -> Result<Vec<f32>, String> {
++    let min_len = (speaker_sr as f32 * cfg.audio_prompt_min_duration).round() as usize;
++    let max_len = (speaker_sr as f32 * cfg.audio_prompt_max_duration).round() as usize;
++    if pcm.len() < min_len {
++        return Err(format!(
++            "voice prompt is too short: got {:.2}s, need at least {:.2}s",
++            pcm.len() as f32 / speaker_sr as f32,
++            cfg.audio_prompt_min_duration
++        ));
++    }
++    Ok(pcm[..pcm.len().min(max_len)].to_vec())
++}
++
++/// Encode mono f32 PCM with the checkpoint's speaker encoder and save an `"emb"` safetensors file.
++///
++/// Loads the checkpoint's weights on its own; for more than one prompt use
++/// [`clone_voices_from_audio`], which loads them once for the whole batch.
++pub fn clone_voice_to_file(
++    model_dir: &Path,
++    pcm: &[f32],
++    sample_rate: u32,
++    output_path: &Path,
++    normalize_loudness: bool,
++) -> Result<CloneInfo, String> {
++    let cfg = read_config(&model_dir.join("config.json")).map_err(|e| e.to_string())?;
++    let speaker_sr = cfg.speaker_mimi_cfg().sample_rate as u32;
++    if sample_rate != speaker_sr {
++        return Err(format!(
++            "voice prompt sample rate is {sample_rate} Hz, expected {speaker_sr} Hz"
++        ));
++    }
++    let mut pcm = prompt_samples(&cfg, pcm, speaker_sr)?;
++    if normalize_loudness {
++        ptts::utils::normalize_loudness(&mut pcm, speaker_sr).map_err(|e| e.to_string())?;
++    }
++    let enc = load_speaker_encoder(model_dir, &cfg)?;
++    write_voice_file(&cfg, &enc, &pcm, output_path)
++}
++
++/// Encode several prompts against one loaded speaker encoder: `<name>.safetensors` per voice in
++/// `voices_dir`. The prompts are already at the checkpoint's prompt sample rate (the app decodes
++/// and resamples them with `AudioDecoder`).
++///
++/// Returns the names written, in order, and `(name, reason)` for the ones that could not be
++/// encoded. `Err` is reserved for the whole batch being impossible (no config, no weights,
++/// no speaker encoder); one malformed prompt does not fail the others.
++pub fn clone_voices_from_audio(
++    model_dir: &Path,
++    voices_dir: &Path,
++    prompts: &[(String, Vec<f32>)],
++    normalize_loudness: bool,
++) -> Result<(Vec<String>, Vec<(String, String)>), String> {
++    let cfg = read_config(&model_dir.join("config.json")).map_err(|e| e.to_string())?;
++    let speaker_sr = cfg.speaker_mimi_cfg().sample_rate as u32;
++    let enc = load_speaker_encoder(model_dir, &cfg)?;
++    std::fs::create_dir_all(voices_dir).map_err(|e| e.to_string())?;
++    let mut written = Vec::new();
++    let mut failed = Vec::new();
++    for (name, pcm) in prompts {
++        let mut pcm = match prompt_samples(&cfg, pcm, speaker_sr) {
++            Ok(pcm) => pcm,
++            Err(e) => {
++                failed.push((name.clone(), e));
++                continue;
++            }
++        };
++        if normalize_loudness {
++            if let Err(e) = ptts::utils::normalize_loudness(&mut pcm, speaker_sr) {
++                failed.push((name.clone(), e.to_string()));
++                continue;
++            }
++        }
++        let path = voices_dir.join(format!("{name}.safetensors"));
++        match write_voice_file(&cfg, &enc, &pcm, &path) {
++            Ok(_) => written.push(name.clone()),
++            Err(e) => failed.push((name.clone(), e)),
++        }
++    }
++    Ok((written, failed))
  }
  
  #[cfg(test)]
 diff --git a/ptts-ffi/src/lib.rs b/ptts-ffi/src/lib.rs
-index 45c4832..46114e9 100644
+index 45c4832..94ac921 100644
 --- a/ptts-ffi/src/lib.rs
 +++ b/ptts-ffi/src/lib.rs
-@@ -274,6 +274,183 @@ pub unsafe extern "C" fn ptts_free(h: *mut PttsHandle) {
+@@ -274,6 +274,308 @@ pub unsafe extern "C" fn ptts_free(h: *mut PttsHandle) {
      }
  }
  
@@ -364,7 +495,8 @@ index 45c4832..46114e9 100644
 +    path: *const c_char,
 +) -> bool {
 +    if h.is_null() || name.is_null() || path.is_null() {
-+        LAST_ERROR.with(|l| *l.borrow_mut() = Some(c_string("null argument to ptts_add_voice_file")));
++        LAST_ERROR
++            .with(|l| *l.borrow_mut() = Some(c_string("null argument to ptts_add_voice_file")));
 +        return false;
 +    }
 +    let h = unsafe { &mut *h };
@@ -391,11 +523,12 @@ index 45c4832..46114e9 100644
 +
 +/// Encode mono f32 PCM at `sample_rate` Hz using the checkpoint's speaker encoder and write an
 +/// `"emb"` `.safetensors` voice file to `output_path`. On failure returns false and sets
-+/// `ptts_last_error(NULL)` on the calling thread.
++/// `ptts_last_error(NULL)` on the calling thread. `frames`/`dim`, when given, receive the
++/// embedding's frame count and width.
 +///
 +/// # Safety
 +/// `model_dir` and `output_path` must be NUL-terminated UTF-8; `pcm` must point to at least
-+/// `n_samples` readable `f32` values.
++/// `n_samples` readable `f32` values; `frames` and `dim` must be null or writable.
 +#[unsafe(no_mangle)]
 +pub unsafe extern "C" fn ptts_clone_voice_to_file(
 +    model_dir: *const c_char,
@@ -404,6 +537,8 @@ index 45c4832..46114e9 100644
 +    sample_rate: u32,
 +    output_path: *const c_char,
 +    normalize_loudness: bool,
++    frames: *mut u32,
++    dim: *mut u32,
 +) -> bool {
 +    if model_dir.is_null() || pcm.is_null() || output_path.is_null() || n_samples == 0 {
 +        LAST_ERROR.with(|l| {
@@ -426,11 +561,22 @@ index 45c4832..46114e9 100644
 +    });
 +    #[cfg(target_vendor = "apple")]
 +    let r: Result<(), String> = {
-+        let _ = (model_dir, output_path, pcm, sample_rate, normalize_loudness);
++        let _ = (model_dir, output_path, pcm, sample_rate, normalize_loudness, frames, dim);
 +        Err("ptts_clone_voice_to_file is only supported on CPU".to_string())
 +    };
 +    match r {
-+        Ok(()) => true,
++        Ok(()) => {
++            #[cfg(not(target_vendor = "apple"))]
++            {
++                if !frames.is_null() {
++                    unsafe { *frames = info.frames as u32 };
++                }
++                if !dim.is_null() {
++                    unsafe { *dim = info.dim as u32 };
++                }
++            }
++            true
++        }
 +        Err(e) => {
 +            LAST_ERROR.with(|l| *l.borrow_mut() = Some(c_string(&e)));
 +            false
@@ -438,19 +584,139 @@ index 45c4832..46114e9 100644
 +    }
 +}
 +
++/// Clone several voices in one call, so the checkpoint's weights are loaded once for the batch.
++///
++/// `names` holds `count` NUL-terminated UTF-8 voice names; `pcm` holds their samples
++/// back to back, the `i`-th starting at `offsets[i]` and ending at `offsets[i + 1]`
++/// (`offsets` has `count + 1` entries). Every prompt must already be at the checkpoint's prompt
++/// sample rate. On success `written` is set to the number of `<name>.safetensors` files written to
++/// `voices_dir`, and `failed` (when not NULL) receives a NUL-separated, NUL-terminated list of the
++/// remaining names -- the ones that could not be encoded. Free it with
++/// [`ptts_strings_free`]. Returns false, with `ptts_last_error(NULL)` set, only when the batch
++/// cannot be attempted at all.
++///
++/// # Safety
++/// `model_dir` and `voices_dir` must be NUL-terminated UTF-8; `names` must hold `count` NUL-
++/// terminated strings; `pcm` must hold `offsets[count]` readable `f32` values; `offsets` must
++/// hold `count + 1` readable `size_t` values; `written` must be writable.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn ptts_clone_voices_to_dir(
++    model_dir: *const c_char,
++    voices_dir: *const c_char,
++    names: *const *const c_char,
++    count: usize,
++    pcm: *const f32,
++    offsets: *const usize,
++    normalize_loudness: bool,
++    written: *mut u32,
++    failed: *mut *mut c_char,
++) -> bool {
++    if model_dir.is_null()
++        || voices_dir.is_null()
++        || names.is_null()
++        || pcm.is_null()
++        || offsets.is_null()
++        || written.is_null()
++    {
++        LAST_ERROR.with(|l| {
++            *l.borrow_mut() = Some(c_string("invalid argument to ptts_clone_voices_to_dir"))
++        });
++        return false;
++    }
++    let model_dir = unsafe { CStr::from_ptr(model_dir) }.to_string_lossy().to_string();
++    let voices_dir = unsafe { CStr::from_ptr(voices_dir) }.to_string_lossy().to_string();
++    let samples = unsafe { std::slice::from_raw_parts(offsets, count + 1) };
++    let pcm = unsafe { std::slice::from_raw_parts(pcm, samples[count]) };
++    if samples.windows(2).any(|w| w[0] > w[1]) {
++        LAST_ERROR.with(|l| {
++            *l.borrow_mut() = Some(c_string("offsets to ptts_clone_voices_to_dir are not sorted"))
++        });
++        return false;
++    }
++    let prompts = (0..count)
++        .map(|i| {
++            let name = unsafe { CStr::from_ptr(*names.add(i)) }.to_string_lossy().to_string();
++            // A bad slice index would unwind through the C ABI, so it is reported instead.
++            let samples = pcm.get(samples[i]..samples[i + 1]).unwrap_or(&[]).to_vec();
++            (name, samples)
++        })
++        .collect::<Vec<_>>();
++    #[cfg(not(target_vendor = "apple"))]
++    let r = guarded(|| {
++        cpu::clone_voices_from_audio(
++            Path::new(&model_dir),
++            Path::new(&voices_dir),
++            &prompts,
++            normalize_loudness,
++        )
++    });
++    #[cfg(target_vendor = "apple")]
++    let r: Result<(Vec<String>, Vec<(String, String)>), String> = {
++        let _ = (model_dir, voices_dir, prompts, normalize_loudness);
++        Err("ptts_clone_voices_to_dir is only supported on CPU".to_string())
++    };
++    match r {
++        Ok((ok_names, failures)) => {
++            for (name, reason) in &failures {
++                tracing::warn!("voice {name} was not written: {reason}");
++            }
++            unsafe { *written = ok_names.len() as u32 };
++            if !failed.is_null() {
++                let names: Vec<String> = failures.into_iter().map(|(name, _)| name).collect();
++                unsafe { *failed = nul_separated_c(names) };
++            }
++            true
++        }
++        Err(e) => {
++            LAST_ERROR.with(|l| *l.borrow_mut() = Some(c_string(&e)));
++            false
++        }
++    }
++}
++
++/// Free the string [`ptts_clone_voices_to_dir`] returned.
++///
++/// # Safety
++/// `s` must be null or come from `ptts_clone_voices_to_dir`, and must not be used afterwards.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn ptts_strings_free(s: *mut c_char) {
++    if !s.is_null() {
++        drop(unsafe { CString::from_raw(s) });
++    }
++}
++
++/// [`nul_separated`] as an owned C string the caller frees with [`ptts_strings_free`]. The bytes
++/// form a valid `CString` by construction: names are UTF-8 without NUL and each is terminated.
++fn nul_separated_c(names: Vec<String>) -> *mut c_char {
++    match CString::new(nul_separated(&names)) {
++        Ok(s) => s.into_raw(),
++        Err(_) => std::ptr::null_mut(),
++    }
++}
++
  #[cfg(test)]
  mod tests {
      use super::check_temperature;
 diff --git a/ptts/src/loader.rs b/ptts/src/loader.rs
-index a919b23..e8b32f1 100644
+index a919b23..991c9f9 100644
 --- a/ptts/src/loader.rs
 +++ b/ptts/src/loader.rs
-@@ -21,6 +21,10 @@ pub fn remap_key(name: &str) -> Option<String> {
+@@ -21,6 +21,20 @@ pub fn remap_key(name: &str) -> Option<String> {
          return None;
      }
  
-+    if name == "flow_lm.bos_before_voice" || name == "flow_lm.fuser.padding_value" {
++    // pocket-tts (Cilla) checkpoints carry the learnt token that the `speaker_wavs` prefix sink
++    // prepends as `flow_lm.bos_before_voice` ([1, 1, d_model]); the runtime loads it as the sink.
++    // `flow_lm.fuser.padding_value` is a *scalar* (one value per segment kind, the padding row the
++    // fuser uses when a segment is empty) and is NOT a sink: mapping it here made the sink load
++    // pick whichever of the two came first and, for a checkpoint that ships only
++    // `padding_value`, fail on a shape mismatch. It has no counterpart in this runtime, so it is
++    // skipped like the other tensors it does not use.
++    if name == "flow_lm.bos_before_voice" {
 +        return Some("flow_lm.condition_provider.conditioners.speaker_wavs.sink".to_string());
++    }
++    if name == "flow_lm.fuser.padding_value" {
++        return None;
 +    }
 +
      let mut name = name.to_string();

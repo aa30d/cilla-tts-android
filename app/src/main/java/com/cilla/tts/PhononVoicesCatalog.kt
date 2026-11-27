@@ -133,13 +133,27 @@ object PhononVoicesCatalog {
         }
     }
 
-    fun installedStems(context: Context): Set<String> {
+    /** The `.safetensors` names already in the English model's `voices/`, lowercased. */
+    fun installedFileNames(context: Context): Set<String> {
         val dir = ModelStorage.voicesDir(context, ModelKind.ENGLISH)
         return dir.listFiles()
             ?.filter { it.isFile && it.name.endsWith(".safetensors") }
-            ?.map { it.name.removeSuffix(".safetensors").lowercase() }
+            ?.map { it.name.lowercase() }
             ?.toSet()
             ?: emptySet()
+    }
+
+    /**
+     * True when [entry] is already in the English model.
+     *
+     * Both the file the catalogue names (`voices/<voice_id>.safetensors`) and the one this app
+     * writes (`<safeStem>.safetensors`, which is what `voiceNames` shows) count: a name that
+     * sanitizes differently from the catalogue's file, or a voice imported by hand under either
+     * name, must not be offered for download again.
+     */
+    fun isInstalled(entry: PhononVoiceEntry, installed: Set<String>): Boolean {
+        val catalogueName = entry.filename.substringAfterLast('/').lowercase()
+        return catalogueName in installed || entry.localFileName.lowercase() in installed
     }
 
     fun downloadSelected(
@@ -192,6 +206,12 @@ object PhononVoicesCatalog {
         val conn = openGet(url)
         try {
             val code = conn.responseCode
+            if (code == 401 || code == 403) {
+                throw IllegalStateException(
+                    "دسترسی به فایل صدا مجاز نیست (HTTP $code)؛ gradium/phonon-voices عمومی است، " +
+                        "شبکه یا پراکسی خود را بررسی کنید"
+                )
+            }
             if (code !in 200..299) {
                 throw IllegalStateException("خطا در دانلود صدا (HTTP $code)")
             }

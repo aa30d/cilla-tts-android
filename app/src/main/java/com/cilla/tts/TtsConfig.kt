@@ -138,6 +138,8 @@ data class TextSegment(val text: String, val isEnglish: Boolean)
  * Latin-script runs are split out and handed to Phonon (`lang = "en"`) whenever Phonon is installed.
  */
 object TextCleaner {
+    /** Persian pieces for [chunkPersian]: what Cilla Mini was tuned on, unchanged since 1.1. */
+    private const val PERSIAN_MAX_CHARS = 200
     private const val ENGLISH_MAX_CHARS = 300
 
     private val englishAllowed = Regex("[^A-Za-z0-9.,!?'\"\\-:;()\\s]")
@@ -155,8 +157,11 @@ object TextCleaner {
 
     /**
      * [text] as the segments to speak, in order. With [splitEnglish] false everything is normalized
-     * and read by the active Persian checkpoint. Persian segments stay un-chunked here so
-     * [TtsEngines] can split them with exact model token counts (`8..80` tokens per chunk).
+     * and read by the active Persian checkpoint.
+     *
+     * Persian segments stay un-chunked here: [TtsEngines] splits them per checkpoint, with Cilla
+     * Lite's exact model token counts (`8..80` tokens per chunk) and Cilla Mini's
+     * [chunkPersian], which is what 1.1 did.
      */
     fun splitSegments(text: String, splitEnglish: Boolean): List<TextSegment> {
         val segments = mutableListOf<TextSegment>()
@@ -183,7 +188,20 @@ object TextCleaner {
         return segments
     }
 
-    private fun chunkEnglish(text: String, maxChars: Int): List<String> {
+    /**
+     * [text] cut at sentence ends into pieces of at most [maxChars]: a checkpoint reads a long
+     * paragraph less steadily than a sentence, and a stop request lands sooner.
+     *
+     * This is Cilla Mini's chunking as 1.1 shipped it; the pieces come out the same as before, so
+     * adding a second Persian checkpoint does not change how the first one sounds.
+     */
+    fun chunkPersian(text: String, maxChars: Int = PERSIAN_MAX_CHARS): List<String> =
+        chunk(text, maxChars, sentenceEnds = ".!?؟؛")
+
+    private fun chunkEnglish(text: String, maxChars: Int): List<String> =
+        chunk(text, maxChars, sentenceEnds = ".!?;:")
+
+    private fun chunk(text: String, maxChars: Int, sentenceEnds: String): List<String> {
         val trimmed = text.trim()
         if (trimmed.isEmpty()) return emptyList()
         if (trimmed.length <= maxChars) return listOf(trimmed)
@@ -193,7 +211,7 @@ object TextCleaner {
         while (index < trimmed.length) {
             val ch = trimmed[index]
             sentence.append(ch)
-            val endsSentence = ch in ".!?;:" || ch == '\n'
+            val endsSentence = ch in sentenceEnds || ch == '\n'
             if ((endsSentence && sentence.length >= maxChars / 3) || sentence.length >= maxChars) {
                 val piece = sentence.toString().trim()
                 if (piece.isNotEmpty()) pieces += piece

@@ -143,6 +143,13 @@ object CillaLiteConverter {
 
         val defaultTemp = getDouble("default_temperature", 0.3)
         val eosThreshold = getDouble("eos_threshold", -2.0)
+        val minPrompt = getDouble("audio_prompt_min_duration", 1.0)
+        val maxPrompt = getDouble("audio_prompt_max_duration", 30.0)
+        // The runtime names a checkpoint by `model_id` and derives `model_ext` ("sig@epoch") from
+        // it; the loader writes that into every voice file it clones, and refuses a file tagged
+        // for another checkpoint. Leaving it null silently drops the tag (see `clone_voice_to_file`).
+        val modelSig = getStr("model_id.sig", getStr("model_id", ""))
+        val modelEpoch = getInt("model_id.epoch", 0)
 
         val flowLmJson = JSONObject()
             .put("d_model", dModel)
@@ -189,14 +196,23 @@ object CillaLiteConverter {
             mimiJson.put("inner_dim", innerDim)
         }
 
+        // A separate `speaker_mimi` block only when the codec's encoder is a different one; when
+        // `mimi.inner_dim` is set the same Mimi encodes prompts, and `speaker_mimi_cfg()` reads
+        // `mimi` -- which is what `VoiceCompat.ModelProfile` expects to decide what fits.
+        val modelIdJson = if (modelSig.isNotEmpty()) {
+            JSONObject().put("sig", modelSig).put("epoch", modelEpoch)
+        } else {
+            null
+        }
+
         val root = JSONObject()
             .put("flow_lm", flowLmJson)
             .put("mimi", mimiJson)
             .put("lsd_decode_steps", 1)
             .put("eos_threshold", eosThreshold)
-            .put("model_id", JSONObject.NULL)
-            .put("audio_prompt_min_duration", 1.0)
-            .put("audio_prompt_max_duration", 30.0)
+            .put("model_id", modelIdJson ?: JSONObject.NULL)
+            .put("audio_prompt_min_duration", minPrompt)
+            .put("audio_prompt_max_duration", maxPrompt)
             .put("cfg_null_audio_empty", true)
             .put("speaker_mimi", JSONObject.NULL)
             .put("conditioners", JSONArray())
@@ -260,11 +276,15 @@ object CillaLiteConverter {
             val indent = cleaned.indexOfFirst { it != ' ' && it != '\t' }
             val trimmed = cleaned.trim()
 
-            if (trimmed.startsWith("- ")) {
+            if (trimmed == "-" || trimmed.startsWith("- ")) {
                 val key = activeListKey
+                // Any list item at least as indented as the key it belongs to, including the
+                // `-`-alone form YAML allows for a nested mapping.
                 if (key != null && indent >= activeListIndent) {
-                    val item = unquote(trimmed.removePrefix("- ").trim())
-                    listAccum.getOrPut(key) { mutableListOf() }.add(item)
+                    val item = unquote(trimmed.removePrefix("-").trim())
+                    if (item.isNotEmpty()) {
+                        listAccum.getOrPut(key) { mutableListOf() }.add(item)
+                    }
                 }
                 continue
             }

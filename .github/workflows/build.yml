@@ -54,6 +54,10 @@ jobs:
           path: native/.cache/jniLibs
           key: ptts-ffi-${{ runner.os }}-${{ hashFiles('native/xn-ptts.patch', 'native/build-ptts-ffi.sh') }}
 
+      - name: Check the native patch applies to upstream
+        shell: bash
+        run: bash native/check-patch.sh
+
       - name: Build patched libptts_ffi.so (arm64-v8a, x86_64)
         if: steps.native-cache.outputs.cache-hit != 'true'
         shell: bash
@@ -73,8 +77,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          mkdir -p app/src/main/jniLibs/arm64-v8a app/src/main/jniLibs/x86_64
           cp native/.cache/jniLibs/arm64-v8a/libptts_ffi.so app/src/main/jniLibs/arm64-v8a/libptts_ffi.so
           cp native/.cache/jniLibs/x86_64/libptts_ffi.so app/src/main/jniLibs/x86_64/libptts_ffi.so
+          # The build script writes this next to the library; a cache hit skips that step.
+          bash native/build-ptts-ffi.sh --symbols-only
+          python3 native/check-ptts-ffi.py "$PWD"
 
       - name: Build debug and release APKs
         shell: bash

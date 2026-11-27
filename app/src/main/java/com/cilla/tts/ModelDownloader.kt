@@ -114,6 +114,19 @@ object ModelDownloader {
                 progress.onMessage(msg)
                 progress.onFraction(null)
             }
+        } else {
+            // Cilla Lite has no baked-in voices: without the encoder the model installs but has
+            // nothing to speak in, so say why rather than leaving an unexplained empty model.
+            progress.onMessage(
+                "کتابخانه بومی این نسخه صداهای نمونه سیلا لایت را نمی‌سازد؛ " +
+                    "برای پخش، کتابخانه را با native/build-ptts-ffi.sh بسازید"
+            )
+        }
+        if (!PhononTTS.hasCillaLiteFfi) {
+            progress.onMessage(
+                "هشدار: کتابخانه بومی ptts_speak_raw/ptts_count_tokens را ندارد؛ " +
+                    "سیلا لایت با مسیر متن ساده‌تر (سیلا مینی) خوانده می‌شود"
+            )
         }
 
         val report = ModelStorage.prepare(dir)
@@ -210,6 +223,18 @@ object ModelDownloader {
     private class AuthException(message: String) : IllegalStateException(message)
 
     /**
+     * The token is a Hugging Face credential and belongs to exactly one origin: `huggingface.co`
+     * (and `www.` of it). The pre-signed CDN/Xet URLs the downloads are redirected to reject a
+     * request carrying a second `Authorization` header, and nothing else here has any business
+     * seeing the token, so the check is on the whole host rather than a suffix: `evil-huggingface.co`
+     * ends with it too.
+     */
+    private fun URL.isHuggingFaceHost(): Boolean {
+        val name = host.lowercase().trimEnd('.')
+        return name == "huggingface.co" || name == "www.huggingface.co"
+    }
+
+    /**
      * Follows redirects manually so the Hugging Face `Authorization: Bearer` header is sent ONLY
      * to `huggingface.co` and stripped before following pre-signed CDN/Xet/S3 redirect URLs
      * (which reject requests carrying a second Authorization header with HTTP 400).
@@ -225,7 +250,7 @@ object ModelDownloader {
                     connectTimeout = 20000
                     readTimeout = 60000
                     setRequestProperty("User-Agent", USER_AGENT)
-                    if (!hfToken.isNullOrEmpty() && parsed.host.endsWith("huggingface.co", ignoreCase = true)) {
+                    if (!hfToken.isNullOrEmpty() && parsed.isHuggingFaceHost()) {
                         setRequestProperty("Authorization", "Bearer $hfToken")
                     }
                 }
@@ -242,7 +267,8 @@ object ModelDownloader {
                     conn = next
                     if (code == 401 || code == 403) {
                         throw AuthException(
-                            "دسترسی به مدل مجاز نیست (HTTP $code). لطفاً ابتدا در صفحه mehdi-hf/cilla-lite روی Hugging Face شرایط دسترسی را تأیید کرده و توکن معتبر (hf_...) وارد کنید."
+                            "دسترسی به مدل مجاز نیست (HTTP $code). لطفاً ابتدا در صفحه mehdi-hf/cilla-lite " +
+                                "روی Hugging Face شرایط دسترسی را تأیید کرده و توکن معتبر (hf_...) وارد کنید."
                         )
                     }
                     if (code !in 200..299) {

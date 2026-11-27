@@ -65,11 +65,56 @@ object ModelStorage {
     fun hasCoreFiles(dir: File): Boolean =
         File(dir, CONFIG_JSON).isFile && File(dir, TOKENIZER_JSON).isFile && weights(dir) != null
 
-    /** True when [kind] has its f32 safetensors weights with a Mimi speaker encoder. */
+    /**
+     * True when [kind] can clone a voice from audio right now: it is a Persian checkpoint whose
+     * f32 `model.safetensors` is installed, whose config names a speaker encoder, and whose native
+     * library was built with the cloning symbols.
+     *
+     * The GGUF path is deliberately excluded: `quantize --no-mimi-encoder` drops the encoder, so a
+     * `model.q8.gguf`-only checkpoint loads for synthesis but cannot encode a prompt, and a
+     * `model.q8.gguf` beside a `model.safetensors` would make the UI promise cloning that then fails
+     * inside the native call.
+     */
     fun canCloneVoices(ctx: Context, kind: ModelKind): Boolean {
         if (!kind.isPersian) return false
+        if (!PhononTTS.hasVoicePromptFfi) return false
         val dir = modelDir(ctx, kind)
-        return hasCoreFiles(dir) && File(dir, "model.safetensors").isFile
+        if (!hasCoreFiles(dir) || !File(dir, "model.safetensors").isFile) return false
+        return ModelProfile.load(dir)?.hasSpeakerEncoder == true
+    }
+
+    /** Why [kind] cannot clone a voice, or null when it can. */
+    fun cloneUnavailableReason(ctx: Context, kind: ModelKind): String? {
+        if (!kind.isPersian) return "کلون صدا فقط برای مدل‌های فارسی است"
+        if (!PhononTTS.hasVoicePromptFfi) {
+            return if (PhononTTS.hasVoiceCloningFfi) {
+                "کتابخانه بومی نصب‌شده از کلون صدا با فایل پشتیبانی می‌کند اما نسخه کامل نیست؛ " +
+                    "با native/build-ptts-ffi.sh دوباره بسازید"
+            } else {
+                "کتابخانه بومی این APK از کلون صدا پشتیبانی نمی‌کند (با native/build-ptts-ffi.sh بسازید)"
+            }
+        }
+        val dir = modelDir(ctx, kind)
+        if (!hasCoreFiles(dir)) return "مدل ${kind.label} نصب نیست"
+        if (!File(dir, "model.safetensors").isFile) {
+            return "مدل ${kind.label} وزن f32 (model.safetensors) ندارد، پس نمی‌تواند صدا کلون کند"
+        }
+        if (ModelProfile.load(dir)?.hasSpeakerEncoder != true) {
+            return "این نسخه از مدل ${kind.label} رمزگذار گوینده (speaker encoder) ندارد"
+        }
+        return null
+    }
+
+    /**
+     * The checkpoint's `audio_prompt_min_duration` / `audio_prompt_max_duration`, in seconds,
+     * clamped to a sane range. The native clone applies exactly these, so trimming a prompt here
+     * with the same numbers keeps the two from disagreeing about what "too short" means.
+     */
+    fun promptDurationBounds(ctx: Context, kind: ModelKind): Pair<Float, Float> {
+        val profile = ModelProfile.load(modelDir(ctx, kind))
+        val min = profile?.promptMinSeconds?.toFloat()?.coerceIn(0.5f, 10f) ?: 1.0f
+        val max = profile?.promptMaxSeconds?.toFloat()?.coerceIn(5f, 60f) ?: 30.0f
+        return if (max <= min) min to (min + 1f) else min to max
     }
 
     /** Every voice file of a checkpoint, as the loader scans them: the safetensors in `voices/`, plus a root `default-voice.safetensors`. */
@@ -232,6 +277,9 @@ object ModelStorage {
             }
         }
 
+        configMismatch(target)?.let { reason ->
+            throw IllegalStateException("مدل ${kind.label} قابل بارگذاری نیست: $reason")
+        }
         val report = prepare(target)
         if (report.usable.isEmpty() && kind != ModelKind.PERSIAN_LITE) {
             throw IllegalStateException(
@@ -243,34 +291,80 @@ object ModelStorage {
     }
 
     /**
-     * Encode any copied prompt audio files in `prompts/` that do not yet have a corresponding
-     * `.safetensors` voice in `voices/`.
+     * A reason this folder's weights cannot work with its `config.json`, or null when they can.
+     *
+     * Only the one mismatch that silently produces bad audio instead of an error is checked here:
+     * a config that declares a `speaker_wavs` prefix sink (Cilla Lite, converted from a
+     * `flow_lm.bos_before_voice` checkpoint) needs that learnt token in the weights. Without it
+     * `ptts_new` fails on a missing tensor, so an imported folder is refused with the reason
+     * instead of at the first attempt to speak.
+     */
+    fun configMismatch(dir: File): String? {
+        val profile = ModelProfile.load(dir) ?: return null
+        if (!profile.hasSpeakerSink) return null
+        val weights = weights(dir) ?: return null
+        if (!weights.name.endsWith(".safetensors")) return null
+        val names = VoiceCompat.tensorNames(weights)
+        if (names.isEmpty()) return null
+        val hasSink = names.any {
+            it == "flow_lm.bos_before_voice" ||
+                it == "flow_lm.condition_provider.conditioners.speaker_wavs.sink"
+        }
+        return if (hasSink) {
+            null
+        } else {
+            "config.json یک توکن speaker_wavs.sink اعلام می‌کند ولی ${weights.name} آن را ندارد"
+        }
+    }
+
+    /** A voice file the loader will actually bind to this checkpoint. */
+    private fun isUsableVoice(file: File, profile: ModelProfile?): Boolean {
+        if (!file.isFile || file.length() == 0L) return false
+        if (profile == null) return true
+        return VoiceCompat.incompatibility(VoiceCompat.inspect(file), profile) == null
+    }
+
+    /**
+     * Decode and encode the prompt audio files in `prompts/` that have no `.safetensors` voice
+     * yet, in a single native call so the checkpoint's weights are loaded once.
+     *
+     * Returns the names written; prompts the model refuses are reported through [onStatus] and
+     * left in place (deleting the user's recording would be worse than retrying).
      */
     fun encodePendingPrompts(ctx: Context, kind: ModelKind, onStatus: (String) -> Unit): Int {
         val dir = modelDir(ctx, kind)
         val prompts = promptsDir(ctx, kind)
         val voices = voicesDir(ctx, kind).apply { mkdirs() }
         if (!prompts.isDirectory || !File(dir, "model.safetensors").isFile) return 0
+        if (!PhononTTS.hasVoicePromptFfi) {
+            onStatus("کتابخانه بومی کلون صدا را پشتیبانی نمی‌کند؛ فایل‌های نمونه کپی شدند")
+            return 0
+        }
 
-        var created = 0
         val audioFiles = prompts.listFiles()?.filter { f ->
             f.isFile && f.extension.lowercase() in AUDIO_EXTENSIONS
         }?.sortedBy { it.name } ?: emptyList()
-
-        for (file in audioFiles) {
+        val pending = audioFiles.mapNotNull { file ->
             val stem = sanitizeVoiceName(file.nameWithoutExtension)
-            val out = File(voices, "$stem.safetensors")
-            if (out.isFile) continue
-            onStatus("در حال استخراج صدای $stem...")
-            val pcm = AudioDecoder.decodeFileToMono24k(file)
-            PhononTTS.cloneVoiceToFile(
-                modelDir = dir,
-                pcm = pcm,
-                sampleRate = AudioDecoder.TARGET_SAMPLE_RATE,
-                outputFile = out,
-                normalizeLoudness = false
-            )
-            created++
+            if (File(voices, "$stem.safetensors").isFile) null else stem to file
+        }
+        if (pending.isEmpty()) return 0
+
+        onStatus("در حال استخراج ${pending.size} بردار صدا (یک‌بار بارگذاری وزن‌ها)...")
+        val decoded = mutableListOf<Pair<String, FloatArray>>()
+        val undecodable = mutableListOf<Pair<String, String>>()
+        for ((stem, file) in pending) {
+            try {
+                decoded += stem to AudioDecoder.decodeFileToMono24k(file)
+            } catch (e: Exception) {
+                undecodable += stem to (e.message ?: "فایل صوتی خوانده نشد")
+            }
+        }
+        val (written, refused) = PhononTTS.cloneVoicesToDir(dir, voices, decoded)
+        val profile = ModelProfile.load(dir)
+        val created = written.count { isUsableVoice(File(voices, "$it.safetensors"), profile) }
+        for ((name, reason) in undecodable + refused) {
+            onStatus("صدا برای $name ساخته نشد: $reason")
         }
         if (created > 0) prepare(dir)
         return created
@@ -291,21 +385,36 @@ object ModelStorage {
             throw IllegalStateException("مدل ${kind.label} از کلون صدا پشتیبانی نمی‌کند یا فایل model.safetensors ندارد")
         }
         val safeName = sanitizeVoiceName(rawName)
-        val validated = AudioDecoder.validateAndTrimPrompt(pcm, AudioDecoder.TARGET_SAMPLE_RATE)
+        val (minSeconds, maxSeconds) = promptDurationBounds(ctx, kind)
+        val validated = AudioDecoder.validateAndTrimPrompt(
+            pcm,
+            AudioDecoder.TARGET_SAMPLE_RATE,
+            minSeconds = minSeconds,
+            maxSeconds = maxSeconds
+        )
         val voices = voicesDir(ctx, kind).apply { mkdirs() }
         val out = File(voices, "$safeName.safetensors")
-        PhononTTS.cloneVoiceToFile(
+        val cloned = PhononTTS.cloneVoiceToFile(
             modelDir = dir,
             pcm = validated,
             sampleRate = AudioDecoder.TARGET_SAMPLE_RATE,
             outputFile = out,
             normalizeLoudness = false
         )
-        val report = prepare(dir)
-        if (!out.isFile) {
-            val reason = report.unsupported.firstOrNull { it.first == out.name }?.second
-            throw IllegalStateException("صدای ساخته‌شده معتبر نبود" + reason?.let { ": $it" }.orEmpty())
+        // Check the file against the config before reporting success: `prepare` removes it when it
+        // does not fit, so "written but unusable" has to fail here rather than at the next load.
+        val profile = ModelProfile.load(dir)
+        val mismatch = profile?.let { VoiceCompat.incompatibility(VoiceCompat.inspect(out), it) }
+        val dimensionMismatch = cloned.dim != 0 && profile?.embWidth != null &&
+            cloned.dim != profile.embWidth
+        if (!isUsableVoice(out, profile) || dimensionMismatch) {
+            out.delete()
+            val reason = mismatch ?: if (dimensionMismatch) "عرض بردار ${cloned.dim} با مدل ${profile?.embWidth} هم‌خوان نیست" else null
+            throw IllegalStateException(
+                "صدای ساخته‌شده معتبر نبود" + reason?.let { ": $it" }.orEmpty()
+            )
         }
+        prepare(dir)
         return safeName to out
     }
 

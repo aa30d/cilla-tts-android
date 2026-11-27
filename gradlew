@@ -88,6 +88,22 @@ APP_BASE_NAME=${0##*/}
 # Discard cd standard output in case $CDPATH is set (https://github.com/gradle/gradle/issues/25036)
 APP_HOME=$( cd -P "${APP_HOME:-./}" > /dev/null && printf '%s\n' "$PWD" ) || exit
 
+# The prebuilt native library is not committed (see .gitignore). Fail here, in a second, with the
+# command that fixes it, rather than at dex/merge time or, worse, on the device: a libptts_ffi.so
+# from another build silently lacks ptts_speak_raw and friends.
+if [ -f "$APP_HOME/native/check-ptts-ffi.py" ]; then
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "warning: python3 not found; skipping the libptts_ffi.so symbol check" >&2
+    elif ! python3 "$APP_HOME/native/check-ptts-ffi.py" "$APP_HOME"; then
+        echo "" >&2
+        echo "The APK would ship a native library this code cannot call." >&2
+        echo "Build it with ./native/build-ptts-ffi.sh (Rust + cargo-ndk + Android NDK)," >&2
+        echo "or run ./build.sh --native, which builds it and then the APK." >&2
+        exit 1
+    fi
+fi
+
+
 # Use the maximum available, or set MAX_FD != -1 to use that value.
 MAX_FD=maximum
 

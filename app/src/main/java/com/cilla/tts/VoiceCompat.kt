@@ -55,19 +55,50 @@ class VoiceFileInfo(
 class ModelProfile(val config: JSONObject) {
 
     /**
-     * Channels the checkpoint's speaker projection takes: `speaker_mimi.mimi.inner_dim` when the
-     * checkpoint has a separate speaker Mimi, otherwise `mimi.inner_dim` or `mimi.dimension`
-     * (`encoder_latent_dim` in xn-ptts).
+     * Channels the checkpoint's speaker projection takes, mirroring `speaker_mimi_cfg()`
+     * (`encoder_latent_dim()` = `inner_dim ?: dimension`):
+     *
+     * - a separate speaker Mimi (`speaker_mimi.mimi`) describes the projection's input on its own;
+     * - otherwise the checkpoint encodes prompts with the *main* codec, and its encoder's latents
+     *   are only `inner_dim` wide when `mimi.inner_dim` says so. Reading `dimension` (the SEANet
+     *   width, 512 for Cilla) instead would let a 512-channel Phonon voice into Cilla's `voices/`
+     *   and break the load with "has 512 channels but the speaker projection take 32".
+     *
+     * Null when the config names no Mimi at all: nothing to check against.
      */
     val latentChannels: Int? = run {
-        val mimi = config.optJSONObject("speaker_mimi")?.optJSONObject("mimi")
-            ?: config.optJSONObject("mimi")
-            ?: return@run null
+        val speakerMimi = config.optJSONObject("speaker_mimi")?.optJSONObject("mimi")
+        if (speakerMimi != null) {
+            val inner = speakerMimi.optInt("inner_dim", 0)
+            if (inner > 0) return@run inner
+            return@run speakerMimi.optInt("dimension", 0).takeIf { it > 0 }
+        }
+        val mimi = config.optJSONObject("mimi") ?: return@run null
         val inner = mimi.optInt("inner_dim", 0)
         if (inner > 0) inner else mimi.optInt("dimension", 0).takeIf { it > 0 }
     }
 
-    /** True when the checkpoint expects a `speaker_wavs` prefix sink (e.g. Cilla Lite `bos_before_voice`). */
+    /** True when the checkpoint carries a speaker projection, which `MimiEnc::load` requires. */
+    val hasSpeakerEncoder: Boolean = run {
+        val speaker = config.optJSONObject("speaker_mimi")
+        // A separate speaker Mimi is its own encoder; otherwise the main codec's encoder is used,
+        // and `MimiEnc::load` insists on the projection weight either way.
+        if (speaker != null) return@run true
+        config.optJSONObject("mimi") != null
+    }
+
+    /** The checkpoint's `audio_prompt_min_duration`, or null when it does not say. */
+    val promptMinSeconds: Double? = config.optDouble("audio_prompt_min_duration", Double.NaN)
+        .takeIf { it.isFinite() && it > 0 }
+
+    /** The checkpoint's `audio_prompt_max_duration`, or null when it does not say. */
+    val promptMaxSeconds: Double? = config.optDouble("audio_prompt_max_duration", Double.NaN)
+        .takeIf { it.isFinite() && it > 0 }
+
+    /**
+     * True when the checkpoint expects a `speaker_wavs` prefix sink (Cilla Lite ships
+     * `flow_lm.bos_before_voice` for it), which is what the patched loader maps that tensor onto.
+     */
     val hasSpeakerSink: Boolean =
         config.optJSONObject("prefix_sinks")?.has("speaker_wavs") == true
 
@@ -160,6 +191,17 @@ object VoiceCompat {
             }
         }
         return null
+    }
+
+    /**
+     * The tensor names a safetensors file holds, metadata excluded. Empty when the file is not one
+     * or its header cannot be read; callers treat that as "nothing to check".
+     */
+    fun tensorNames(file: File): Set<String> = try {
+        val header = readHeader(file)
+        header.keys().asSequence().filter { it != "__metadata__" }.toSet()
+    } catch (_: Exception) {
+        emptySet()
     }
 
     /** The JSON header of a safetensors file: an 8-byte little-endian length, then that many bytes. */

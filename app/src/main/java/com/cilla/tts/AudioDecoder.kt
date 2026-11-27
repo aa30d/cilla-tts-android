@@ -61,6 +61,13 @@ object AudioDecoder {
         return validateAndTrimPrompt(mono24k, TARGET_SAMPLE_RATE)
     }
 
+    /**
+     * Check that [pcm] is long enough (and audible) and cut it to [maxSeconds].
+     *
+     * [minSeconds] / [maxSeconds] default to this file's own bounds; callers that know the
+     * checkpoint's `audio_prompt_*_duration` pass those instead, so a prompt is trimmed exactly as
+     * the native encoder would trim it and the two never disagree about what is too short.
+     */
     fun validateAndTrimPrompt(
         pcm: FloatArray,
         sampleRate: Int = TARGET_SAMPLE_RATE,
@@ -73,7 +80,7 @@ object AudioDecoder {
             throw IllegalArgumentException(
                 String.format(
                     Locale.US,
-                    "طول صدای نمونه خیلی کوتاه است (%.1f ثانیه)؛ حداقل %.0f ثانیه لازم است",
+                    "طول صدای نمونه خیلی کوتاه است (%.1f ثانیه)؛ حداقل %.1f ثانیه لازم است",
                     secs,
                     minSeconds
                 )
