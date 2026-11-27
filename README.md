@@ -1,49 +1,68 @@
-# Cilla Mini TTS (سیلا مینی) — Android
+# Cilla TTS (سیلا) — Android
 
 On-device Persian **and English** text-to-speech app, plus a system TTS engine
-(`TextToSpeechService`), powered by [gradium-ai/xn-ptts](https://github.com/gradium-ai/xn-ptts)
-with two checkpoints:
+(`TextToSpeechService`), powered by a patched build of
+[gradium-ai/xn-ptts](https://github.com/gradium-ai/xn-ptts) with three supported checkpoints:
 
-| Language | Model | Licence |
-| --- | --- | --- |
-| Persian | [Cilla mini](https://huggingface.co/spaces/mehdi-hf/cilla-mini-demo) by [Oncilla AI](https://oncillaai.com) | Non-commercial (CC BY-NC 4.0) |
-| English | [Phonon 31M EN](https://huggingface.co/gradium/phonon-31m-en) by [Gradium](https://gradium.ai) | Apache 2.0 |
-
-## What is new in 1.1
-
-- **English is read by the English model.** Text is split by script and each piece goes to the
-  checkpoint that speaks it: Persian (and numbers, punctuation) to Cilla, Latin runs to Phonon.
-  Phonon is loaded lazily, the first time a Latin run needs it.
-- **Voices can no longer be mixed between models.** The native loader reads every file in
-  `voices/` when it opens a checkpoint, so one voice from the other model used to kill the whole
-  load with `has 512 channels but the speaker projection take 32`. Each voice file's safetensors
-  header is now checked against the checkpoint's `config.json` before loading, and a mismatched
-  file is moved to `voices_unsupported/` with a message instead of breaking the model. The new
-  **انتخاب پوشه صدا** setting files a folder of voices automatically into the right model.
-- **Two tabs.** **خواندن** (reading, the default) and **تنظیمات** (settings).
-  - Reading: text box, one play/stop toggle directly under it, save button under that, then
-    Persian voice, English voice, temperature and seed.
-  - Settings: download / pick a folder for the Persian model, the same for the English model,
-    the voice folder picker, deleting voices, deleting models and voices from app storage, and
-    the licence text.
-- **Separate voice selection per model** (`voice_fa` and `voice_en`); the system TTS engine and
-  the app share it.
-- **Version 1.1.0** (versionCode 2).
+| Language | Model | Size | Licence |
+| --- | --- | --- | --- |
+| Persian (fast) | [Cilla Mini](https://huggingface.co/spaces/mehdi-hf/cilla-mini-demo) (18M) by [Oncilla AI](https://oncillaai.com) | ~112 MB | Non-commercial (CC BY-NC 4.0) |
+| Persian (high quality) | [Cilla Lite](https://huggingface.co/mehdi-hf/cilla-lite) (100M) by [Oncilla AI](https://oncillaai.com) | ~440 MB | Non-commercial (CC BY-NC 4.0) |
+| English | [Phonon 31M EN](https://huggingface.co/gradium/phonon-31m-en) + [Phonon Voices](https://huggingface.co/gradium/phonon-voices) by [Gradium](https://gradium.ai) | ~130 MB | Apache 2.0 |
 
 ## Features
 
-- **System TTS engine:** registers as `سیلا مینی (Cilla Mini TTS)` in Android's preferred
-  text-to-speech engine settings for TalkBack and e-book readers. Persian and mixed pages are
-  read with the right checkpoint per stretch.
-- **Persistent settings:** voice per model, temperature, and seed (fixed or random) are applied
-  in both the app and the system engine.
-- **Model management:** downloads Cilla from Hugging Face or imports a local model folder through
-  the Storage Access Framework; the same for Phonon (`model.safetensors` or `model.q8.gguf`).
-- **Save to Downloads:** exports the synthesized speech as a 24 kHz WAV file.
+- **Cilla Lite (100M) & Cilla Mini (18M) switcher:** install either or both Persian checkpoints
+  and switch between them directly from the reading tab. Each model keeps its own voice selection
+  and default temperature (`0.30` for Cilla Lite, `0.70` for Cilla Mini / Phonon).
+- **Automatic on-device Cilla Lite conversion:** download `mehdi-hf/cilla-lite` directly inside the
+  app (with your Hugging Face Read Token after accepting the repo's gated access) or import a local
+  folder via the Storage Access Framework. The app automatically converts `pocket-tts` `config.yaml`
+  → `config.json`, SentencePiece `tokenizer.model` → Hugging Face `tokenizer.json`, and encodes
+  `prompts/*.wav` into speaker `.safetensors` embeddings on-device.
+- **Full Persian frontend (`normalize_fa` + `speak_fa`):** Unicode/character normalization,
+  diacritic & invisible-character cleanup, ZWNJ hygiene, Persian number & decimal/percentage
+  spelling, exact model-token chunking (`8–80` tokens per sentence), silence trimming, and runaway
+  recovery during WAV export.
+- **On-device Voice Cloning (Cilla Lite & Cilla Mini):** create custom speaker embeddings directly
+  on your phone either by recording 3–10 seconds with the microphone or importing any audio file
+  (WAV, MP3, M4A, OGG, FLAC — automatically decoded and resampled to 24 kHz mono before Mimi
+  encoding).
+- **Phonon English Voice Browser (`gradium/phonon-voices`):** browse and download any of the 37
+  English voices (US, UK, and character voices) from `gradium/phonon-voices` directly into the
+  English model.
+- **Mixed-script reading & System TTS engine:** registers as `سیلا (Cilla TTS)` in Android's
+  text-to-speech settings for TalkBack and e-book readers. Latin runs are routed to Phonon while
+  Persian text goes to the active Cilla checkpoint.
+- **Save to Downloads:** exports synthesized speech as a 24 kHz mono WAV file.
+
+## Native Engine Patch (`native/`)
+
+Upstream `xn-ptts` is extended via `native/xn-ptts.patch` to support:
+
+1. Loading `pocket-tts` / `cilla-lite` checkpoints (`flow_lm.bos_before_voice` and
+   `flow_lm.fuser.padding_value` remapped to `speaker_wavs.sink`).
+2. `ptts_speak_raw` (raw `frames_after_eos` control without internal `xn-ptts` text splitting),
+   `ptts_count_tokens` (exact SentencePiece token counting for chunking),
+   `ptts_supports_voice_cloning`, `ptts_add_voice_file`, and `ptts_clone_voice_to_file`
+   (on-device Mimi voice cloning into `.safetensors` files).
+
+Prebuilt `libptts_ffi.so` libraries are checked in under `app/src/main/jniLibs/{arm64-v8a,x86_64}`,
+and GitHub Actions automatically builds and bundles the patched `libptts_ffi.so` for both ABIs.
+
+To rebuild the patched native libraries locally (requires Rust + `cargo-ndk` + Android NDK):
+
+```bash
+./native/build-ptts-ffi.sh
+```
+
+Or build both native libraries and the debug APK together:
+
+```bash
+./build.sh --native
+```
 
 ## Build
-
-The native libraries for `arm64-v8a` and `x86_64` are included under `app/src/main/jniLibs`.
 
 ```bash
 ./gradlew assembleDebug
@@ -54,13 +73,13 @@ The debug APK is written to `app/build/outputs/apk/debug/`. A release APK can be
 
 ## GitHub Actions
 
-- **Android CI** builds debug and release APKs on pushes to `main`/`master`, on pull requests,
-  and on manual runs. APKs are available as workflow artifacts.
-- **Release Android APK** publishes a GitHub Release when a version tag such as `v1.1.0` is
-  pushed, with an unsigned APK and its SHA-256 checksum.
+- **Android CI** compiles the patched `libptts_ffi.so` (cached by patch + script hash) and builds
+  debug and release APKs on pushes to `main`/`master`, on pull requests, and on manual runs.
+- **Release Android APK** compiles the patched native library and publishes a GitHub Release when a
+  version tag such as `v1.2.0` is pushed, with an unsigned APK and its SHA-256 checksum.
 
 ## Models are not in the APK
 
-Cilla alone is 112 MB, so both checkpoints are downloaded on first run into the app's private
-storage (`files/model`, `files/model_en`). Neither `huggingface.co` nor the models are
-redistributed here; the model hosting terms apply, and Cilla is non-commercial only.
+Checkpoints are downloaded into the app's private storage (`files/model`, `files/model_lite`,
+`files/model_en`). Neither Hugging Face nor the models are redistributed here; model hosting terms
+and licences apply (Cilla Mini and Cilla Lite are non-commercial CC BY-NC 4.0).

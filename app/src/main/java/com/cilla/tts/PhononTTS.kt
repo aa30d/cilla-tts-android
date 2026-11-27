@@ -5,8 +5,10 @@ package com.cilla.tts
 import com.sun.jna.Callback
 import com.sun.jna.Library
 import com.sun.jna.Native
+import com.sun.jna.NativeLibrary
 import com.sun.jna.Pointer
 import com.sun.jna.Structure
+import java.io.File
 
 /**
  * A loaded model. Loading is the slow part, so keep one around and reuse it, and [close] it when
@@ -45,6 +47,10 @@ class PhononTTS(modelDir: String, lang: String) : AutoCloseable {
     val languages: List<String>
         get() = names(lib.ptts_languages(open()))
 
+    /** True if the checkpoint includes a speaker encoder and the native library supports cloning. */
+    val supportsVoiceCloning: Boolean
+        get() = hasVoiceCloningFfi && extLib.ptts_supports_voice_cloning(open()).toInt() != 0
+
     private fun names(block: Pointer): List<String> {
         val names = mutableListOf<String>()
         var offset = 0L
@@ -75,6 +81,25 @@ class PhononTTS(modelDir: String, lang: String) : AutoCloseable {
     fun setSeed(seed: Long) = lib.ptts_set_seed(open(), seed)
 
     /**
+     * Register a newly created `.safetensors` voice on the live handle without reloading the model.
+     */
+    fun addVoiceFile(name: String, file: File): Boolean {
+        if (!hasAddVoiceFfi) return false
+        check(extLib.ptts_add_voice_file(open(), name, file.absolutePath))
+        return true
+    }
+
+    /**
+     * Token count of [text] using the checkpoint's loaded Hugging Face tokenizer, or null if the
+     * loaded native library predates `ptts_count_tokens`.
+     */
+    fun countTokens(text: String): Int? {
+        if (!hasCountTokensFfi) return null
+        val n = extLib.ptts_count_tokens(open(), text)
+        return if (n >= 0) n else null
+    }
+
+    /**
      * Speak [text], handing [onAudio] each piece of audio as soon as it is made: 24 kHz mono
      * floats in [-1, 1]. Return false from [onAudio] to stop early. Returns once all the audio
      * has been handed over, with the utterance's timings. What [onAudio] throws, [speak] rethrows.
@@ -85,6 +110,27 @@ class PhononTTS(modelDir: String, lang: String) : AutoCloseable {
         thrown = null
         val out = Result()
         val ok = lib.ptts_speak(open(), text, onFrame, null, out)
+        thrown?.let {
+            thrown = null
+            throw it
+        }
+        check(ok)
+        return out
+    }
+
+    /**
+     * Speak a single pre-normalized chunk without `prepare_text_prompt` (no forced punctuation or
+     * re-chunking) and with explicit [framesAfterEos] (e.g. `0` for Cilla Lite). Falls back to
+     * [speak] if an older `libptts_ffi.so` is loaded.
+     */
+    fun speakRaw(text: String, framesAfterEos: Int, onAudio: (FloatArray) -> Boolean): Result {
+        if (!hasRawSpeakFfi) {
+            return speak(text, onAudio)
+        }
+        this.onAudio = onAudio
+        thrown = null
+        val out = Result()
+        val ok = extLib.ptts_speak_raw(open(), text, framesAfterEos, onFrame, null, out)
         thrown?.let {
             thrown = null
             throw it
@@ -133,7 +179,75 @@ class PhononTTS(modelDir: String, lang: String) : AutoCloseable {
         }
     }
 
-    private companion object {
-        val lib: Lib = Native.load("ptts_ffi", Lib::class.java)
+    /** Extended FFI functions added by `native/xn-ptts.patch` for Cilla Lite and voice cloning. */
+    @Suppress("FunctionName")
+    private interface ExtLib : Library {
+        fun ptts_speak_raw(
+            h: Pointer,
+            text: String,
+            framesAfterEos: Int,
+            cb: Lib.FrameFn,
+            user: Pointer?,
+            out: Result
+        ): Byte
+
+        fun ptts_count_tokens(h: Pointer, text: String): Int
+        fun ptts_supports_voice_cloning(h: Pointer): Byte
+        fun ptts_add_voice_file(h: Pointer, name: String, path: String): Byte
+        fun ptts_clone_voice_to_file(
+            modelDir: String,
+            pcm: FloatArray,
+            nSamples: Long,
+            sampleRate: Int,
+            outputPath: String,
+            normalizeLoudness: Byte
+        ): Byte
+    }
+
+    companion object {
+        private val lib: Lib = Native.load("ptts_ffi", Lib::class.java)
+        private val extLib: ExtLib by lazy { Native.load("ptts_ffi", ExtLib::class.java) }
+
+        private fun hasSymbol(name: String): Boolean = runCatching {
+            NativeLibrary.getInstance("ptts_ffi").getFunction(name) != null
+        }.getOrDefault(false)
+
+        val hasRawSpeakFfi: Boolean by lazy { hasSymbol("ptts_speak_raw") }
+        val hasCountTokensFfi: Boolean by lazy { hasSymbol("ptts_count_tokens") }
+        val hasAddVoiceFfi: Boolean by lazy { hasSymbol("ptts_add_voice_file") }
+        val hasVoiceCloningFfi: Boolean by lazy { hasSymbol("ptts_clone_voice_to_file") }
+
+        /**
+         * Encode 24 kHz mono float PCM with [modelDir]'s speaker encoder and write an `"emb"`
+         * `.safetensors` voice file to [outputFile]. Works without keeping the full TTS model
+         * loaded in memory.
+         */
+        fun cloneVoiceToFile(
+            modelDir: File,
+            pcm: FloatArray,
+            sampleRate: Int = AudioDecoder.TARGET_SAMPLE_RATE,
+            outputFile: File,
+            normalizeLoudness: Boolean = false
+        ) {
+            if (!hasVoiceCloningFfi) {
+                throw IllegalStateException(
+                    "نسخه کتابخانه بومی libptts_ffi.so در این APK از کلون صدا پشتیبانی نمی‌کند. " +
+                        "لطفاً نسخه ساخته‌شده با native/build-ptts-ffi.sh را نصب کنید."
+                )
+            }
+            val ok = extLib.ptts_clone_voice_to_file(
+                modelDir.absolutePath,
+                pcm,
+                pcm.size.toLong(),
+                sampleRate,
+                outputFile.absolutePath,
+                if (normalizeLoudness) 1.toByte() else 0.toByte()
+            )
+            if (ok.toInt() == 0) {
+                throw IllegalStateException(
+                    lib.ptts_last_error(null) ?: "خطا در استخراج بردار صدا"
+                )
+            }
+        }
     }
 }

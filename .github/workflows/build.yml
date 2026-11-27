@@ -47,11 +47,40 @@ jobs:
         with:
           gradle-version: '8.9'
 
+      - name: Cache patched libptts_ffi.so
+        id: native-cache
+        uses: actions/cache@v4
+        with:
+          path: native/.cache/jniLibs
+          key: ptts-ffi-${{ runner.os }}-${{ hashFiles('native/xn-ptts.patch', 'native/build-ptts-ffi.sh') }}
+
+      - name: Build patched libptts_ffi.so (arm64-v8a, x86_64)
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup update stable --no-self-update || true
+          rustup default stable || true
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          if [ ! -d "$SDK/ndk" ] || [ -z "$(ls -A "$SDK/ndk" 2>/dev/null)" ]; then
+            if [ -x "$SDK/cmdline-tools/latest/bin/sdkmanager" ]; then
+              "$SDK/cmdline-tools/latest/bin/sdkmanager" --install "ndk;27.2.12479018"
+            fi
+          fi
+          OUT_DIR="$PWD/native/.cache/jniLibs" bash native/build-ptts-ffi.sh 2>&1 | tee build.log
+
+      - name: Install patched libptts_ffi.so
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp native/.cache/jniLibs/arm64-v8a/libptts_ffi.so app/src/main/jniLibs/arm64-v8a/libptts_ffi.so
+          cp native/.cache/jniLibs/x86_64/libptts_ffi.so app/src/main/jniLibs/x86_64/libptts_ffi.so
+
       - name: Build debug and release APKs
         shell: bash
         run: |
           set -o pipefail
-          ./gradlew assembleDebug assembleRelease --no-daemon --stacktrace 2>&1 | tee build.log
+          ./gradlew assembleDebug assembleRelease --no-daemon --stacktrace 2>&1 | tee -a build.log
 
       - name: Upload APK artifacts
         if: success()

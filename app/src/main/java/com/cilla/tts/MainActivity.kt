@@ -13,15 +13,25 @@ import android.os.Environment
 import android.provider.MediaStore
 import android.system.Os
 import android.text.Editable
+import android.text.InputType
 import android.text.TextWatcher
 import android.view.View
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
+import android.widget.Button
+import android.widget.CheckBox
+import android.widget.EditText
+import android.widget.LinearLayout
+import android.widget.RadioButton
+import android.widget.RadioGroup
+import android.widget.ScrollView
 import android.widget.Spinner
+import android.widget.TextView
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import androidx.documentfile.provider.DocumentFile
 import com.cilla.tts.databinding.ActivityMainBinding
 import com.google.android.material.tabs.TabLayout
 import java.io.File
@@ -31,9 +41,8 @@ import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * Two tabs: reading, which is what the app is for, and settings, where the models and voices
- * live. The playback and save buttons sit right under the text they act on, and the two voice
- * pickers are separate because the checkpoints share no voices.
+ * Two tabs: reading (synthesis + WAV export + active Persian model & voice pickers) and settings
+ * (Cilla Mini, Cilla Lite 100M, on-device voice cloning, Phonon 31M + Phonon Voices browser).
  */
 class MainActivity : AppCompatActivity() {
 
@@ -43,11 +52,18 @@ class MainActivity : AppCompatActivity() {
     private val stopRequested = AtomicBoolean(false)
     private var playing = false
     private var busy = false
+    private var suppressUiEvents = false
     private var pendingWavText: String? = null
+    private var pendingCloneTarget: ModelKind? = null
 
     private val pickPersianModel =
         registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
             if (uri != null) importModel(ModelKind.PERSIAN, uri)
+        }
+
+    private val pickLiteModel =
+        registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+            if (uri != null) importModel(ModelKind.PERSIAN_LITE, uri)
         }
 
     private val pickEnglishModel =
@@ -60,11 +76,27 @@ class MainActivity : AppCompatActivity() {
             if (uri != null) addVoices(uri)
         }
 
+    private val pickCloneAudio =
+        registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+            if (uri != null) promptCloneFromUri(uri)
+        }
+
     private val pickDownloadPermission =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
             val text = pendingWavText
             pendingWavText = null
             if (granted && text != null) saveWav(text) else setStatus("اجازه نوشتن در حافظه داده نشد.")
+        }
+
+    private val pickRecordPermission =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            val target = pendingCloneTarget
+            pendingCloneTarget = null
+            if (granted && target != null) {
+                showRecordCloneDialog(target)
+            } else {
+                setStatus("اجازه دسترسی به میکروفون داده نشد.")
+            }
         }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -81,8 +113,8 @@ class MainActivity : AppCompatActivity() {
 
         refreshModelState()
         updatePlayButton()
-        if (!engines.hasPersianModel() && !engines.hasEnglishModel()) {
-            setStatus("مدلی نصب نیست. از تب «تنظیمات» مدل فارسی یا انگلیسی را دانلود یا انتخاب کنید.")
+        if (!engines.hasAnyPersianModel() && !engines.hasEnglishModel()) {
+            setStatus("مدلی نصب نیست. از تب «تنظیمات» سیلا مینی، سیلا لایت یا مدل انگلیسی را نصب کنید.")
         }
     }
 
@@ -107,12 +139,26 @@ class MainActivity : AppCompatActivity() {
     // ---------------------------------------------------------------- reading tab
 
     private fun setUpReadingControls() {
-        val savedTemperature = TtsPrefs.getTemperature(this)
-        binding.tempSlider.value = savedTemperature.coerceIn(0f, 1.5f)
-        showTemperature(savedTemperature)
+        binding.persianModelGroup.setOnCheckedChangeListener { _, checkedId ->
+            if (suppressUiEvents) return@setOnCheckedChangeListener
+            val chosen = if (checkedId == R.id.radioCillaLite) {
+                ModelKind.PERSIAN_LITE
+            } else {
+                ModelKind.PERSIAN
+            }
+            TtsPrefs.setActivePersianKind(this, chosen)
+            syncTemperatureForActiveModel()
+            populateVoices()
+            updateCloneSection()
+            updatePlayButton()
+        }
+
+        syncTemperatureForActiveModel()
         binding.tempSlider.addOnChangeListener { _, value, _ ->
-            showTemperature(value)
-            TtsPrefs.setTemperature(this, value)
+            if (suppressUiEvents) return@addOnChangeListener
+            val activeKind = TtsPrefs.getActivePersianKind(this)
+            showTemperature(value, activeKind)
+            TtsPrefs.setTemperature(this, value, activeKind)
         }
 
         val randomSeed = TtsPrefs.isRandomSeed(this)
@@ -137,8 +183,18 @@ class MainActivity : AppCompatActivity() {
         binding.saveWavButton.setOnClickListener { requestSaveWav() }
     }
 
-    private fun showTemperature(value: Float) {
-        binding.tempLabel.text = String.format(Locale.US, "دما (Temperature): %.2f", value)
+    private fun syncTemperatureForActiveModel() {
+        val activeKind = TtsPrefs.getActivePersianKind(this)
+        val saved = TtsPrefs.getTemperature(this, activeKind).coerceIn(0f, 1.5f)
+        suppressUiEvents = true
+        binding.tempSlider.value = saved
+        suppressUiEvents = false
+        showTemperature(saved, activeKind)
+    }
+
+    private fun showTemperature(value: Float, activeKind: ModelKind) {
+        val hint = if (activeKind == ModelKind.PERSIAN_LITE) "پیشنهادی: 0.30" else "پیشنهادی: 0.70"
+        binding.tempLabel.text = String.format(Locale.US, "دما (Temperature): %.2f (%s)", value, hint)
     }
 
     private fun speak() {
@@ -156,6 +212,7 @@ class MainActivity : AppCompatActivity() {
         }
         val temperature = binding.tempSlider.value
         val seed = TtsPrefs.resolveSeed(this)
+        val activeFa = engines.activePersianKind()
 
         stopRequested.set(false)
         playing = true
@@ -163,9 +220,9 @@ class MainActivity : AppCompatActivity() {
         updatePlayButton()
         setStatus(
             if (!withEnglish && segments.any { it.isEnglish }) {
-                "در حال تولید صدا... (مدل انگلیسی نصب نیست؛ متن انگلیسی با مدل فارسی خوانده می‌شود)"
+                "در حال تولید صدا (${activeFa.label})... (مدل انگلیسی نصب نیست)"
             } else {
-                "در حال تولید صدا..."
+                "در حال تولید صدا (${activeFa.label})..."
             }
         )
 
@@ -183,14 +240,14 @@ class MainActivity : AppCompatActivity() {
                         !stopRequested.get()
                     }
                 }
-                last = engines.speak(segments, temperature, seed, sink)
+                last = engines.speak(segments, temperature, seed, exactPostProcess = false, sink = sink)
             } catch (e: Exception) {
                 failure = e.message
             } finally {
                 try {
                     track.stop()
                 } catch (_: IllegalStateException) {
-                    // Stopping a track that never started is not worth a crash.
+                    // Stopping a track that never started is harmless.
                 }
                 track.release()
                 val stopped = stopRequested.get()
@@ -261,7 +318,7 @@ class MainActivity : AppCompatActivity() {
             try {
                 val chunks = mutableListOf<FloatArray>()
                 var total = 0
-                engines.speak(segments, temperature, seed) { pcm ->
+                engines.speak(segments, temperature, seed, exactPostProcess = true) { pcm ->
                     if (stopRequested.get()) {
                         false
                     } else {
@@ -270,23 +327,27 @@ class MainActivity : AppCompatActivity() {
                         true
                     }
                 }
-                val samples = FloatArray(total)
-                var offset = 0
-                for (chunk in chunks) {
-                    chunk.copyInto(samples, offset)
-                    offset += chunk.size
+                if (!stopRequested.get() && total > 0) {
+                    val samples = FloatArray(total)
+                    var offset = 0
+                    for (chunk in chunks) {
+                        chunk.copyInto(samples, offset)
+                        offset += chunk.size
+                    }
+                    savedAs = writeWavToDownloads(samples)
                 }
-                savedAs = writeWavToDownloads(samples)
             } catch (e: Exception) {
                 failure = e.message
             } finally {
                 val name = savedAs
                 val error = failure
+                val stopped = stopRequested.get()
                 runOnUiThread {
                     playing = false
                     updatePlayButton()
                     when {
                         error != null -> setStatus("خطا در ذخیره فایل: $error")
+                        stopped -> setStatus("ذخیره فایل متوقف شد.")
                         name != null -> setStatus("فایل صوتی ذخیره شد: Downloads/$name")
                         else -> setStatus("ذخیره فایل صوتی انجام نشد.")
                     }
@@ -348,15 +409,24 @@ class MainActivity : AppCompatActivity() {
 
     private fun setUpSettingsControls() {
         binding.downloadFaButton.setOnClickListener { downloadModel(ModelKind.PERSIAN) }
-        binding.downloadEnButton.setOnClickListener { downloadModel(ModelKind.ENGLISH) }
         binding.selectFaFolderButton.setOnClickListener { pickPersianModel.launch(null) }
+
+        binding.downloadLiteButton.setOnClickListener { promptDownloadCillaLite() }
+        binding.selectLiteFolderButton.setOnClickListener { pickLiteModel.launch(null) }
+
+        binding.cloneRecordButton.setOnClickListener { requestRecordCloneVoice() }
+        binding.clonePickFileButton.setOnClickListener { requestPickCloneAudio() }
+
+        binding.downloadEnButton.setOnClickListener { downloadModel(ModelKind.ENGLISH) }
+        binding.downloadPhononVoicesButton.setOnClickListener { openPhononVoicesBrowser() }
         binding.selectEnFolderButton.setOnClickListener { pickEnglishModel.launch(null) }
+
         binding.importVoicesButton.setOnClickListener { pickVoices.launch(null) }
         binding.deleteVoicesButton.setOnClickListener { confirmDeleteVoices() }
         binding.deleteModelsButton.setOnClickListener { confirmDeleteModels() }
     }
 
-    private fun downloadModel(kind: ModelKind) {
+    private fun downloadModel(kind: ModelKind, hfToken: String? = null) {
         if (busy) return
         stopSpeaking()
         runTask("در حال آماده‌سازی دانلود مدل ${kind.label}...") {
@@ -365,13 +435,55 @@ class MainActivity : AppCompatActivity() {
                 onMessage = { message -> postStatus(message) },
                 onFraction = { fraction -> runOnUiThread { showDownloadProgress(fraction) } }
             )
-            val report = if (kind == ModelKind.PERSIAN) {
-                ModelDownloader.installPersian(this, progress)
-            } else {
-                ModelDownloader.installEnglish(this, progress)
+            val report = when (kind) {
+                ModelKind.PERSIAN -> ModelDownloader.installPersian(this, progress)
+                ModelKind.PERSIAN_LITE -> {
+                    val r = ModelDownloader.installCillaLite(this, hfToken, progress)
+                    TtsPrefs.setActivePersianKind(this, ModelKind.PERSIAN_LITE)
+                    r
+                }
+                ModelKind.ENGLISH -> ModelDownloader.installEnglish(this, progress)
             }
-            buildReport("مدل ${kind.label} نصب و آماده شد.", report)
+            if (kind == ModelKind.PERSIAN_LITE && report.usable.isEmpty()) {
+                "مدل سیلا لایت دانلود و تبدیل شد. برای استفاده، یک صدا کلون کنید یا فایل صوتی نمونه بدهید."
+            } else {
+                buildReport("مدل ${kind.label} نصب و آماده شد.", report)
+            }
         }
+    }
+
+    private fun promptDownloadCillaLite() {
+        if (busy) return
+        val pad = dp(20)
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(pad, dp(12), pad, 0)
+        }
+        val info = TextView(this).apply {
+            text = "مخزن mehdi-hf/cilla-lite روی Hugging Face دارای محدودیت دسترسی (Gated) است.\n" +
+                "۱) در صفحه مدل روی Hugging Face دکمه تأیید دسترسی را بزنید.\n" +
+                "۲) توکن خواندن (Read Token) خود را وارد کنید:"
+            textSize = 13f
+        }
+        val tokenInput = EditText(this).apply {
+            hint = "hf_xxxxxxxxxxxxxxxxxxxxxxxx"
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            setText(TtsPrefs.getHfToken(this@MainActivity))
+            setSelection(text.length)
+        }
+        container.addView(info)
+        container.addView(tokenInput)
+
+        AlertDialog.Builder(this)
+            .setTitle("دانلود سیلا لایت (Cilla Lite 100M)")
+            .setView(container)
+            .setNegativeButton("انصراف", null)
+            .setPositiveButton("شروع دانلود") { _, _ ->
+                val token = tokenInput.text?.toString()?.trim().orEmpty()
+                if (token.isNotEmpty()) TtsPrefs.setHfToken(this, token)
+                downloadModel(ModelKind.PERSIAN_LITE, token)
+            }
+            .show()
     }
 
     private fun importModel(kind: ModelKind, uri: Uri) {
@@ -380,9 +492,441 @@ class MainActivity : AppCompatActivity() {
         runTask("در حال کپی مدل ${kind.label}...") {
             engines.close(kind)
             val report = ModelStorage.importModel(this, kind, uri) { message -> postStatus(message) }
-            buildReport("مدل ${kind.label} از پوشه انتخاب‌شده نصب شد.", report)
+            if (kind == ModelKind.PERSIAN_LITE) {
+                TtsPrefs.setActivePersianKind(this, ModelKind.PERSIAN_LITE)
+            }
+            if (report.usable.isEmpty()) {
+                "مدل ${kind.label} نصب شد. اکنون از بخش «کلون صدا» یک گوینده برای آن بسازید."
+            } else {
+                buildReport("مدل ${kind.label} از پوشه انتخاب‌شده نصب شد.", report)
+            }
         }
     }
+
+    // ---------------------------------------------------------------- Phonon Voices browser
+
+    private fun openPhononVoicesBrowser() {
+        if (busy) return
+        busy = true
+        updatePlayButton()
+        setStatus("در حال دریافت فهرست صداهای انگلیسی از gradium/phonon-voices...")
+        binding.progressBar.isIndeterminate = true
+        binding.progressBar.visibility = View.VISIBLE
+
+        executor.execute {
+            val result = runCatching { PhononVoicesCatalog.fetchEnglishVoices() }
+            runOnUiThread {
+                busy = false
+                binding.progressBar.visibility = View.GONE
+                binding.progressBar.isIndeterminate = false
+                updatePlayButton()
+                result.fold(
+                    onSuccess = { entries ->
+                        setStatus("${entries.size} صدای انگلیسی دریافت شد.")
+                        showPhononVoicesDialog(entries)
+                    },
+                    onFailure = { err ->
+                        setStatus("خطا در دریافت فهرست صداها: ${err.message}")
+                    }
+                )
+            }
+        }
+    }
+
+    private fun showPhononVoicesDialog(entries: List<PhononVoiceEntry>) {
+        val installed = PhononVoicesCatalog.installedStems(this)
+        val selectedIds = LinkedHashSet<String>()
+        var activeFilter = "all"
+
+        val pad = dp(16)
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(pad, dp(8), pad, dp(8))
+        }
+
+        val filterRow = RadioGroup(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+        }
+        val filters = listOf(
+            "all" to "همه (${entries.size})",
+            "en-us" to "US",
+            "en-gb" to "UK",
+            "characters" to "کاراکتر"
+        )
+        val listContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+        val selectionSummary = TextView(this).apply {
+            textSize = 12f
+            setPadding(0, dp(4), 0, dp(6))
+        }
+
+        fun visibleEntries(): List<PhononVoiceEntry> = when (activeFilter) {
+            "all" -> entries
+            else -> entries.filter { it.locale.equals(activeFilter, ignoreCase = true) }
+        }
+
+        fun updateSummary() {
+            selectionSummary.text = "انتخاب‌شده برای دانلود: ${selectedIds.size} صدا"
+        }
+
+        fun rebuildList() {
+            listContainer.removeAllViews()
+            for (entry in visibleEntries()) {
+                val alreadyInstalled = entry.safeStem.lowercase() in installed
+                val row = LinearLayout(this).apply {
+                    orientation = LinearLayout.VERTICAL
+                    setPadding(0, dp(4), 0, dp(6))
+                }
+                val cb = CheckBox(this).apply {
+                    val badge = if (alreadyInstalled) " (نصب شده)" else ""
+                    text = "${entry.name}$badge — ${entry.shortSubtitle()}"
+                    isChecked = entry.voiceId in selectedIds
+                    setOnCheckedChangeListener { _, checked ->
+                        if (checked) selectedIds.add(entry.voiceId) else selectedIds.remove(entry.voiceId)
+                        updateSummary()
+                    }
+                }
+                row.addView(cb)
+                if (entry.description.isNotBlank()) {
+                    val desc = TextView(this).apply {
+                        text = entry.description.take(140)
+                        textSize = 11f
+                        setPadding(dp(32), 0, dp(8), 0)
+                    }
+                    row.addView(desc)
+                }
+                listContainer.addView(row)
+            }
+            updateSummary()
+        }
+
+        filters.forEachIndexed { idx, (key, label) ->
+            val rb = RadioButton(this).apply {
+                id = View.generateViewId()
+                text = label
+                textSize = 12f
+                isChecked = idx == 0
+                tag = key
+            }
+            filterRow.addView(rb)
+        }
+        filterRow.setOnCheckedChangeListener { group, checkedId ->
+            val rb = group.findViewById<RadioButton>(checkedId)
+            activeFilter = (rb?.tag as? String) ?: "all"
+            rebuildList()
+        }
+
+        val toggleAllBtn = Button(this).apply {
+            text = "انتخاب / لغو انتخاب همه موارد این دسته"
+            setOnClickListener {
+                val visible = visibleEntries()
+                val allSelected = visible.isNotEmpty() && visible.all { it.voiceId in selectedIds }
+                if (allSelected) {
+                    visible.forEach { selectedIds.remove(it.voiceId) }
+                } else {
+                    visible.forEach { selectedIds.add(it.voiceId) }
+                }
+                rebuildList()
+            }
+        }
+
+        val scroll = ScrollView(this).apply {
+            addView(listContainer)
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                dp(340)
+            )
+        }
+
+        root.addView(filterRow)
+        root.addView(toggleAllBtn)
+        root.addView(selectionSummary)
+        root.addView(scroll)
+        rebuildList()
+
+        AlertDialog.Builder(this)
+            .setTitle("دانلود صداهای انگلیسی (Phonon Voices)")
+            .setView(root)
+            .setNegativeButton("انصراف", null)
+            .setPositiveButton("دانلود انتخاب‌شده‌ها") { _, _ ->
+                val chosen = entries.filter { it.voiceId in selectedIds }
+                if (chosen.isEmpty()) {
+                    setStatus("هیچ صدایی انتخاب نشد.")
+                    return@setPositiveButton
+                }
+                downloadPhononVoices(chosen)
+            }
+            .show()
+    }
+
+    private fun downloadPhononVoices(entries: List<PhononVoiceEntry>) {
+        if (busy) return
+        stopSpeaking()
+        runTask("در حال دانلود ${entries.size} صدای انگلیسی...") {
+            engines.close(ModelKind.ENGLISH)
+            val count = PhononVoicesCatalog.downloadSelected(this, entries) { idx, total, entry ->
+                postStatus("در حال دانلود ${entry.name} ($idx از $total)...")
+                runOnUiThread {
+                    showDownloadProgress((idx * 100) / total)
+                }
+            }
+            val firstNew = entries.firstOrNull()?.safeStem
+            if (firstNew != null && TtsPrefs.getEnglishVoice(this).isNullOrEmpty()) {
+                TtsPrefs.setEnglishVoice(this, firstNew)
+            }
+            if (ModelStorage.hasCoreFiles(this, ModelKind.ENGLISH)) {
+                "$count صدای انگلیسی با موفقیت دانلود و آماده شد."
+            } else {
+                "$count صدای انگلیسی ذخیره شد. برای پخش، مدل انگلیسی (Phonon) را هم دانلود کنید."
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- Voice Cloning
+
+    private fun resolveCloneTarget(): ModelKind? {
+        val active = TtsPrefs.getActivePersianKind(this)
+        if (ModelStorage.canCloneVoices(this, active)) return active
+        val other = if (active == ModelKind.PERSIAN_LITE) ModelKind.PERSIAN else ModelKind.PERSIAN_LITE
+        if (ModelStorage.canCloneVoices(this, other)) return other
+        return null
+    }
+
+    private fun requestRecordCloneVoice() {
+        if (busy) return
+        val target = resolveCloneTarget()
+        if (target == null) {
+            setStatus("ابتدا مدل سیلا لایت یا سیلا مینی را نصب کنید تا بتوانید صدا کلون کنید.")
+            return
+        }
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            pendingCloneTarget = target
+            pickRecordPermission.launch(Manifest.permission.RECORD_AUDIO)
+            return
+        }
+        showRecordCloneDialog(target)
+    }
+
+    private fun requestPickCloneAudio() {
+        if (busy) return
+        if (resolveCloneTarget() == null) {
+            setStatus("ابتدا مدل سیلا لایت یا سیلا مینی را نصب کنید تا بتوانید صدا کلون کنید.")
+            return
+        }
+        pickCloneAudio.launch(arrayOf("audio/*"))
+    }
+
+    private fun showRecordCloneDialog(defaultTarget: ModelKind) {
+        val recorder = VoiceRecorder()
+        var recordedPcm: FloatArray? = null
+        var chosenTarget = defaultTarget
+
+        val pad = dp(20)
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(pad, dp(12), pad, dp(4))
+        }
+
+        val targetPicker = createCloneTargetRadioGroup(defaultTarget) { chosenTarget = it }
+        if (targetPicker != null) {
+            container.addView(TextView(this).apply { text = "مدل هدف:"; textSize = 13f })
+            container.addView(targetPicker)
+        }
+
+        val nameInput = EditText(this).apply {
+            hint = "نام گوینده (مثلاً my_voice یا ali)"
+            setText("voice_${System.currentTimeMillis() % 1000}")
+            setSelection(text.length)
+        }
+        val timerText = TextView(this).apply {
+            text = "۳ تا ۱۰ ثانیه در محیط آرام صحبت کنید و با مکث کوتاه پایان دهید."
+            textSize = 13f
+            setPadding(0, dp(10), 0, dp(8))
+        }
+        val recordBtn = Button(this).apply {
+            text = "● شروع ضبط"
+        }
+
+        container.addView(TextView(this).apply { text = "نام گوینده:"; textSize = 13f })
+        container.addView(nameInput)
+        container.addView(timerText)
+        container.addView(recordBtn)
+
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("کلون صدا با میکروفون (${defaultTarget.label})")
+            .setView(container)
+            .setNegativeButton("انصراف") { _, _ -> recorder.cancel() }
+            .setPositiveButton("ساخت گوینده", null)
+            .create()
+
+        dialog.setOnShowListener {
+            val saveBtn = dialog.getButton(AlertDialog.BUTTON_POSITIVE)
+            saveBtn.isEnabled = false
+
+            fun finishRecording() {
+                if (recordedPcm != null) return
+                val pcm = recorder.stop()
+                recordedPcm = pcm
+                val secs = pcm.size.toFloat() / AudioDecoder.TARGET_SAMPLE_RATE.toFloat()
+                recordBtn.text = "● ضبط مجدد"
+                if (secs >= AudioDecoder.MIN_PROMPT_SECONDS) {
+                    timerText.text = String.format(
+                        Locale.US,
+                        "ضبط آماده است (%.1f ثانیه). «ساخت گوینده» را بزنید.",
+                        secs
+                    )
+                    saveBtn.isEnabled = true
+                } else {
+                    timerText.text = String.format(
+                        Locale.US,
+                        "ضبط خیلی کوتاه بود (%.1f ثانیه)؛ حداقل ۱ ثانیه و ترجیحاً ۳ تا ۱۰ ثانیه ضبط کنید.",
+                        secs
+                    )
+                    saveBtn.isEnabled = false
+                }
+            }
+
+            recordBtn.setOnClickListener {
+                if (recorder.isRecording) {
+                    finishRecording()
+                } else {
+                    recordedPcm = null
+                    saveBtn.isEnabled = false
+                    recordBtn.text = "■ پایان ضبط"
+                    timerText.text = "در حال ضبط: 0.0 ثانیه..."
+                    recorder.start(
+                        maxSeconds = 15f,
+                        onTick = { secs ->
+                            runOnUiThread {
+                                if (recorder.isRecording) {
+                                    timerText.text = String.format(
+                                        Locale.US,
+                                        "در حال ضبط: %.1f / 15.0 ثانیه (پیشنهاد: ۳ تا ۱۰ ثانیه)",
+                                        secs
+                                    )
+                                }
+                            }
+                        },
+                        onMaxReached = {
+                            runOnUiThread { finishRecording() }
+                        },
+                        onError = { err ->
+                            runOnUiThread {
+                                recordBtn.text = "● شروع ضبط"
+                                timerText.text = "خطا: $err"
+                            }
+                        }
+                    )
+                }
+            }
+
+            saveBtn.setOnClickListener {
+                val pcm = recordedPcm ?: return@setOnClickListener
+                val name = nameInput.text?.toString().orEmpty()
+                dialog.dismiss()
+                runCloneFromPcm(chosenTarget, name, pcm)
+            }
+        }
+
+        dialog.setOnDismissListener { recorder.cancel() }
+        dialog.show()
+    }
+
+    private fun promptCloneFromUri(uri: Uri) {
+        val defaultTarget = resolveCloneTarget() ?: return
+        var chosenTarget = defaultTarget
+        val guessedName = DocumentFile.fromSingleUri(this, uri)?.name
+            ?.substringBeforeLast('.')
+            ?.takeIf { it.isNotBlank() }
+            ?: "cloned_voice"
+
+        val pad = dp(20)
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(pad, dp(12), pad, dp(4))
+        }
+        val targetPicker = createCloneTargetRadioGroup(defaultTarget) { chosenTarget = it }
+        if (targetPicker != null) {
+            container.addView(TextView(this).apply { text = "مدل هدف:"; textSize = 13f })
+            container.addView(targetPicker)
+        }
+        val nameInput = EditText(this).apply {
+            hint = "نام گوینده"
+            setText(ModelStorage.sanitizeVoiceName(guessedName))
+            setSelection(text.length)
+        }
+        container.addView(TextView(this).apply {
+            text = "نام گوینده جدید (فایل‌های ۳ تا ۱۰ ثانیه‌ای بهترین نتیجه را می‌دهند):"
+            textSize = 13f
+        })
+        container.addView(nameInput)
+
+        AlertDialog.Builder(this)
+            .setTitle("کلون صدا از فایل صوتی")
+            .setView(container)
+            .setNegativeButton("انصراف", null)
+            .setPositiveButton("ساخت گوینده") { _, _ ->
+                val voiceName = nameInput.text?.toString().orEmpty()
+                runCloneFromUri(chosenTarget, voiceName, uri)
+            }
+            .show()
+    }
+
+    private fun createCloneTargetRadioGroup(
+        defaultTarget: ModelKind,
+        onSelect: (ModelKind) -> Unit
+    ): RadioGroup? {
+        val canMini = ModelStorage.canCloneVoices(this, ModelKind.PERSIAN)
+        val canLite = ModelStorage.canCloneVoices(this, ModelKind.PERSIAN_LITE)
+        if (!(canMini && canLite)) return null
+
+        val group = RadioGroup(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val rbLite = RadioButton(this).apply {
+            id = View.generateViewId()
+            text = "سیلا لایت"
+            isChecked = defaultTarget == ModelKind.PERSIAN_LITE
+        }
+        val rbMini = RadioButton(this).apply {
+            id = View.generateViewId()
+            text = "سیلا مینی"
+            isChecked = defaultTarget == ModelKind.PERSIAN
+        }
+        group.addView(rbLite)
+        group.addView(rbMini)
+        group.setOnCheckedChangeListener { _, checkedId ->
+            onSelect(if (checkedId == rbLite.id) ModelKind.PERSIAN_LITE else ModelKind.PERSIAN)
+        }
+        return group
+    }
+
+    private fun runCloneFromPcm(target: ModelKind, rawName: String, pcm: FloatArray) {
+        if (busy) return
+        stopSpeaking()
+        runTask("در حال ساخت گوینده کلون‌شده برای ${target.label}...") {
+            val (voiceName, voiceFile) = ModelStorage.cloneVoiceFromPcm(this, target, rawName, pcm)
+            engines.registerVoiceFile(target, voiceName, voiceFile)
+            TtsPrefs.setVoice(this, target, voiceName)
+            TtsPrefs.setActivePersianKind(this, target)
+            "گوینده «$voiceName» با موفقیت برای ${target.label} ساخته و فعال شد."
+        }
+    }
+
+    private fun runCloneFromUri(target: ModelKind, rawName: String, uri: Uri) {
+        if (busy) return
+        stopSpeaking()
+        runTask("در حال تبدیل فایل صوتی و ساخت گوینده برای ${target.label}...") {
+            val (voiceName, voiceFile) = ModelStorage.cloneVoiceFromUri(this, target, rawName, uri)
+            engines.registerVoiceFile(target, voiceName, voiceFile)
+            TtsPrefs.setVoice(this, target, voiceName)
+            TtsPrefs.setActivePersianKind(this, target)
+            "گوینده «$voiceName» با موفقیت برای ${target.label} ساخته و فعال شد."
+        }
+    }
+
+    // ---------------------------------------------------------------- Voice & model management
 
     private fun addVoices(uri: Uri) {
         if (busy) return
@@ -390,7 +934,9 @@ class MainActivity : AppCompatActivity() {
         runTask("در حال افزودن صداها...") {
             engines.close()
             val summary = ModelStorage.importVoices(this, uri) { message -> postStatus(message) }
-            val builder = StringBuilder("صداها اضافه شدند: ${summary.persian} برای فارسی، ${summary.english} برای انگلیسی.")
+            val builder = StringBuilder(
+                "صداها اضافه شدند: ${summary.persian} برای سیلا مینی، ${summary.persianLite} برای سیلا لایت، ${summary.english} برای انگلیسی."
+            )
             if (summary.skipped.isNotEmpty()) {
                 builder.append(" ${summary.skipped.size} فایل کنار گذاشته شد.")
                 summary.skipped.take(2).forEach { (name, reason) ->
@@ -414,37 +960,95 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun confirmDeleteVoices() {
+        val voiceItems = mutableListOf<Pair<ModelKind, String>>()
+        for (kind in ModelKind.entries) {
+            for (name in ModelStorage.voiceNames(this, kind)) {
+                voiceItems += kind to name
+            }
+        }
+        if (voiceItems.isEmpty()) {
+            setStatus("هیچ صدایی برای حذف وجود ندارد.")
+            return
+        }
+        val labels = (voiceItems.map { (k, name) -> "$name (${k.label})" } + "حذف همه صداها (${voiceItems.size} فایل)").toTypedArray()
         AlertDialog.Builder(this)
             .setTitle("حذف صداها")
-            .setMessage("همه فایل‌های صدا از حافظه برنامه حذف شوند؟ مدل‌ها می‌مانند.")
-            .setNegativeButton("انصراف", null)
-            .setPositiveButton("حذف") { _, _ ->
-                stopSpeaking()
-                runTask("در حال حذف صداها...") {
-                    engines.close()
-                    val removed = ModelStorage.deleteVoices(this)
-                    "صداها حذف شدند ($removed فایل)."
+            .setItems(labels) { _, which ->
+                if (which == voiceItems.size) {
+                    AlertDialog.Builder(this)
+                        .setTitle("حذف همه صداها")
+                        .setMessage("همه فایل‌های صدا از حافظه برنامه حذف شوند؟ مدل‌ها می‌مانند.")
+                        .setNegativeButton("انصراف", null)
+                        .setPositiveButton("حذف") { _, _ ->
+                            stopSpeaking()
+                            runTask("در حال حذف صداها...") {
+                                engines.close()
+                                val removed = ModelStorage.deleteVoices(this)
+                                "صداها حذف شدند ($removed فایل)."
+                            }
+                        }
+                        .show()
+                } else {
+                    val (kind, voiceName) = voiceItems[which]
+                    stopSpeaking()
+                    runTask("در حال حذف گوینده «$voiceName»...") {
+                        engines.close(kind)
+                        val removed = ModelStorage.deleteVoice(this, kind, voiceName)
+                        if (removed) {
+                            "گوینده «$voiceName» از ${kind.label} حذف شد."
+                        } else {
+                            "گوینده «$voiceName» پیدا نشد."
+                        }
+                    }
                 }
             }
+            .setNegativeButton("انصراف", null)
             .show()
     }
 
     private fun confirmDeleteModels() {
+        val installed = ModelKind.entries.filter { ModelStorage.modelDir(this, it).exists() }
+        if (installed.isEmpty()) {
+            setStatus("هیچ مدلی برای حذف وجود ندارد.")
+            return
+        }
+        val labels = (installed.map { k ->
+            val size = ModelStorage.formatSize(ModelStorage.sizeOf(ModelStorage.modelDir(this, k)))
+            "حذف ${k.label} ($size)"
+        } + "حذف همه مدل‌ها و صداها").toTypedArray()
+
         AlertDialog.Builder(this)
-            .setTitle("حذف مدل‌ها")
-            .setMessage(
-                "مدل‌ها و صداهای ذخیره‌شده در حافظه داخلی برنامه حذف شوند؟ " +
-                    "برای استفاده دوباره باید مدل را از نو دانلود یا انتخاب کنید."
-            )
-            .setNegativeButton("انصراف", null)
-            .setPositiveButton("حذف") { _, _ ->
-                stopSpeaking()
-                runTask("در حال حذف مدل‌ها...") {
-                    engines.close()
-                    ModelStorage.deleteModels(this)
-                    "مدل‌ها و صداها از حافظه برنامه حذف شدند."
+            .setTitle("حذف از حافظه برنامه")
+            .setItems(labels) { _, which ->
+                val isAll = which == installed.size
+                val target = if (isAll) null else installed[which]
+                val title = if (isAll) "حذف همه مدل‌ها" else "حذف ${target!!.label}"
+                val msg = if (isAll) {
+                    "همه مدل‌ها و صداهای ذخیره‌شده در حافظه داخلی برنامه حذف شوند؟"
+                } else {
+                    "مدل ${target!!.label} و صداهای آن از حافظه برنامه حذف شوند؟"
                 }
+                AlertDialog.Builder(this)
+                    .setTitle(title)
+                    .setMessage(msg)
+                    .setNegativeButton("انصراف", null)
+                    .setPositiveButton("حذف") { _, _ ->
+                        stopSpeaking()
+                        runTask("در حال حذف...") {
+                            if (target == null) {
+                                engines.close()
+                                ModelStorage.deleteModels(this)
+                                "همه مدل‌ها و صداها از حافظه برنامه حذف شدند."
+                            } else {
+                                engines.close(target)
+                                ModelStorage.deleteModel(this, target)
+                                "مدل ${target.label} حذف شد."
+                            }
+                        }
+                    }
+                    .show()
             }
+            .setNegativeButton("انصراف", null)
             .show()
     }
 
@@ -493,11 +1097,34 @@ class MainActivity : AppCompatActivity() {
 
     private fun refreshModelState() {
         binding.modelFaStatus.text = describe(ModelKind.PERSIAN)
+        binding.modelLiteStatus.text = describe(ModelKind.PERSIAN_LITE)
         binding.modelEnStatus.text = describe(ModelKind.ENGLISH)
-        val used = ModelStorage.sizeOf(ModelStorage.modelDir(this, ModelKind.PERSIAN)) +
-            ModelStorage.sizeOf(ModelStorage.modelDir(this, ModelKind.ENGLISH))
+
+        val used = ModelKind.entries.sumOf {
+            ModelStorage.sizeOf(ModelStorage.modelDir(this, it))
+        }
         binding.storageText.text = "حجم اشغال‌شده در حافظه برنامه: ${ModelStorage.formatSize(used)}"
+
+        val activeFa = TtsPrefs.getActivePersianKind(this)
+        suppressUiEvents = true
+        binding.radioCillaMini.isChecked = activeFa == ModelKind.PERSIAN
+        binding.radioCillaLite.isChecked = activeFa == ModelKind.PERSIAN_LITE
+        binding.radioCillaMini.isEnabled = ModelStorage.hasCoreFiles(this, ModelKind.PERSIAN) || !ModelStorage.hasCoreFiles(this, ModelKind.PERSIAN_LITE)
+        binding.radioCillaLite.isEnabled = ModelStorage.hasCoreFiles(this, ModelKind.PERSIAN_LITE) || !ModelStorage.hasCoreFiles(this, ModelKind.PERSIAN)
+        suppressUiEvents = false
+
+        syncTemperatureForActiveModel()
+        updateCloneSection()
         populateVoices()
+    }
+
+    private fun updateCloneSection() {
+        val target = resolveCloneTarget()
+        binding.cloneStatusText.text = if (target != null) {
+            "مدل هدف کلون صدا: ${target.label} — با ضبط ۳ تا ۱۰ ثانیه یا انتخاب فایل صوتی، گوینده جدید بسازید."
+        } else {
+            "برای کلون صدا، ابتدا سیلا لایت یا سیلا مینی را نصب کنید."
+        }
     }
 
     private fun describe(kind: ModelKind): String {
@@ -505,17 +1132,26 @@ class MainActivity : AppCompatActivity() {
         if (!dir.exists()) return "نصب نشده"
         if (!ModelStorage.hasCoreFiles(dir)) return "فایل‌های مدل ناقص است"
         val voices = ModelStorage.voiceNames(dir)
-        if (voices.isEmpty()) return "وزن مدل هست ولی هیچ صدایی ندارد"
-        return "آماده — ${voices.size} گوینده (${voices.joinToString("، ")}) — " +
-            ModelStorage.formatSize(ModelStorage.sizeOf(dir))
+        if (voices.isEmpty()) {
+            return "وزن مدل آماده است (${ModelStorage.formatSize(ModelStorage.sizeOf(dir))}) — هنوز صدایی ندارد (از بخش کلون صدا بسازید)"
+        }
+        val preview = if (voices.size <= 6) {
+            voices.joinToString("، ")
+        } else {
+            voices.take(5).joinToString("، ") + " و ${voices.size - 5} تای دیگر"
+        }
+        return "آماده — ${voices.size} گوینده ($preview) — ${ModelStorage.formatSize(ModelStorage.sizeOf(dir))}"
     }
 
     private fun populateVoices() {
+        val activeFa = TtsPrefs.getActivePersianKind(this)
+        binding.voiceFaLabel.text = "گوینده فارسی (${activeFa.label})"
         bindVoices(
             binding.voiceFaSpinner,
-            ModelKind.PERSIAN,
-            TtsPrefs.getPersianVoice(this)
-        ) { TtsPrefs.setPersianVoice(this, it) }
+            activeFa,
+            TtsPrefs.getVoice(this, activeFa)
+        ) { TtsPrefs.setVoice(this, activeFa, it) }
+
         bindVoices(
             binding.voiceEnSpinner,
             ModelKind.ENGLISH,
@@ -540,7 +1176,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun updatePlayButton() {
-        val hasModel = engines.hasPersianModel() || engines.hasEnglishModel()
+        val hasModel = engines.hasAnyPersianModel() || engines.hasEnglishModel()
+        val canClone = resolveCloneTarget() != null
         if (playing) {
             binding.playStopButton.text = "■ توقف"
             binding.playStopButton.isEnabled = true
@@ -550,13 +1187,20 @@ class MainActivity : AppCompatActivity() {
         }
         binding.saveWavButton.isEnabled = hasModel && !busy && !playing
         binding.downloadFaButton.isEnabled = !busy
-        binding.downloadEnButton.isEnabled = !busy
         binding.selectFaFolderButton.isEnabled = !busy
+        binding.downloadLiteButton.isEnabled = !busy
+        binding.selectLiteFolderButton.isEnabled = !busy
+        binding.cloneRecordButton.isEnabled = canClone && !busy && !playing
+        binding.clonePickFileButton.isEnabled = canClone && !busy && !playing
+        binding.downloadEnButton.isEnabled = !busy
+        binding.downloadPhononVoicesButton.isEnabled = !busy
         binding.selectEnFolderButton.isEnabled = !busy
         binding.importVoicesButton.isEnabled = !busy
         binding.deleteVoicesButton.isEnabled = !busy
         binding.deleteModelsButton.isEnabled = !busy
     }
+
+    private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
 
     override fun onDestroy() {
         super.onDestroy()
