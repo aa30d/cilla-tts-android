@@ -37,7 +37,7 @@ class CillaTtsService : TextToSpeechService() {
 
     override fun onIsLanguageAvailable(lang: String?, country: String?, variant: String?): Int {
         return when (languageCode(lang)) {
-            CODE_PERSIAN -> if (engines.hasPersianModel()) {
+            CODE_PERSIAN -> if (engines.hasAnyPersianModel()) {
                 TextToSpeech.LANG_AVAILABLE
             } else {
                 TextToSpeech.LANG_MISSING_DATA
@@ -60,7 +60,7 @@ class CillaTtsService : TextToSpeechService() {
     }
 
     override fun onGetLanguage(): Array<String> {
-        val code = language ?: if (engines.hasPersianModel()) CODE_PERSIAN else CODE_ENGLISH
+        val code = language ?: if (engines.hasAnyPersianModel()) CODE_PERSIAN else CODE_ENGLISH
         val tag = if (code == CODE_PERSIAN) "fa" else "en"
         return arrayOf(Locale.forLanguageTag(tag).isO3Language, "", "")
     }

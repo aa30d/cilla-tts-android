@@ -11,3 +11,16 @@ local.properties
 *.jks
 *.keystore
 keystore.properties
+
+# Native build work/cache directories
+native/.work/
+native/.cache/
+
+# The patched libptts_ffi.so is built by native/build-ptts-ffi.sh (locally or in CI), not
+# committed: a checked-in binary drifts from the Kotlin that calls it, and GitHub Actions only
+# overwrites it after it has checked it out. The symbol manifest next to it stays tracked.
+app/src/main/jniLibs/*/libptts_ffi.so
+
+# Python bytecode from native/check-*.py
+__pycache__/
+*.pyc

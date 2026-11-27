@@ -1,44 +1,64 @@
 package com.cilla.tts
 
 import android.content.Context
+import java.io.File
+import kotlin.math.sqrt
 
 /**
- * The two checkpoints, loaded on demand and reused: loading is the slow part (a Cilla checkpoint
- * takes seconds), and each model must only ever be handed its own voices.
+ * Manages the installed checkpoints (`cilla-mini`, `cilla-lite`, `phonon-31m-en`), loaded lazily
+ * on demand and reused across utterances.
  *
- * Cilla runs with `lang = "none"` because the runtime's text normalizer has no Persian and
- * refuses `"fa"`; Phonon runs with `lang = "en"` so numbers and dates are expanded for it. Phonon
- * is loaded only once some English text actually needs it, which halves the memory an idle app
- * holds.
+ * At most one Persian checkpoint (`cilla-mini` or `cilla-lite`) is kept resident in memory at a
+ * time so switching models never doubles native memory usage.
  */
 class TtsEngines(context: Context) : AutoCloseable {
 
     private val appContext = context.applicationContext
+    private var persianKindLoaded: ModelKind? = null
     private var persian: PhononTTS? = null
     private var english: PhononTTS? = null
     private var persianError: String? = null
     private var englishError: String? = null
 
-    fun hasPersianModel(): Boolean = ModelStorage.isReady(ModelStorage.modelDir(appContext, ModelKind.PERSIAN))
+    fun activePersianKind(): ModelKind = TtsPrefs.getActivePersianKind(appContext)
 
-    fun hasEnglishModel(): Boolean = ModelStorage.isReady(ModelStorage.modelDir(appContext, ModelKind.ENGLISH))
+    fun hasPersianModel(kind: ModelKind = activePersianKind()): Boolean =
+        ModelStorage.isReady(appContext, kind)
 
-    fun voices(kind: ModelKind): List<String> = ModelStorage.voiceNames(ModelStorage.modelDir(appContext, kind))
+    fun hasAnyPersianModel(): Boolean =
+        ModelStorage.isReady(appContext, ModelKind.PERSIAN) ||
+            ModelStorage.isReady(appContext, ModelKind.PERSIAN_LITE)
+
+    fun hasEnglishModel(): Boolean = ModelStorage.isReady(appContext, ModelKind.ENGLISH)
+
+    fun voices(kind: ModelKind): List<String> =
+        ModelStorage.voiceNames(ModelStorage.modelDir(appContext, kind))
 
     @Synchronized
-    fun persianOrNull(): PhononTTS? {
-        persian?.let { return it }
-        val dir = ModelStorage.modelDir(appContext, ModelKind.PERSIAN)
+    fun persianOrNull(kind: ModelKind = activePersianKind()): PhononTTS? {
+        if (persian != null && persianKindLoaded == kind) return persian
+        // Unload the other Persian model first to keep memory bounded.
+        if (persian != null && persianKindLoaded != kind) {
+            persian?.close()
+            persian = null
+            persianKindLoaded = null
+            persianError = null
+        }
+
+        val dir = ModelStorage.modelDir(appContext, kind)
         if (!ModelStorage.isReady(dir)) {
-            persianError = "مدل فارسی نصب نیست"
+            persianError = if (ModelStorage.hasCoreFiles(dir)) {
+                "مدل ${kind.label} نصب است اما هیچ صدایی ندارد؛ یک صدا کلون یا اضافه کنید"
+            } else {
+                "مدل ${kind.label} نصب نیست"
+            }
             return null
         }
-        // The loader takes every voice file in the folder at once, so a voice that belongs to the
-        // other checkpoint has to be set aside first: see ModelStorage.prepare.
         ModelStorage.prepare(dir)
         return try {
             PhononTTS(dir.absolutePath, LANGUAGE_PERSIAN).also {
                 persian = it
+                persianKindLoaded = kind
                 persianError = null
             }
         } catch (e: Exception) {
@@ -70,9 +90,55 @@ class TtsEngines(context: Context) : AutoCloseable {
     val persianFailure: String? get() = persianError
     val englishFailure: String? get() = englishError
 
+    /** The last reason a freshly cloned voice could not be registered on a live engine. */
+    @Volatile
+    var lastRegistrationFailure: String? = null
+        private set
+
+    /**
+     * Registers a newly cloned voice on the already-loaded engine, or closes the engine so the
+     * next call loads it cleanly with the file in `voices/`.
+     *
+     * Registration can fail for a real reason -- `Synth::add_voice_file` refuses a checkpoint with
+     * baked-in voices once guidance is on, and refuses a file whose width does not match -- so the
+     * message is kept in [lastRegistrationFailure] instead of being swallowed: the voice still works
+     * after the reload, but a silent `close()` would have looked like the app losing it.
+     *
+     * @return true when the voice is usable right now (registered, or reloaded on next use);
+     * false when it was registered on no engine, in which case nothing needed doing.
+     */
+    @Synchronized
+    fun registerVoiceFile(kind: ModelKind, voiceName: String, voiceFile: File): Boolean {
+        lastRegistrationFailure = null
+        val loaded = when (kind) {
+            ModelKind.ENGLISH -> english
+            else -> if (persianKindLoaded == kind) persian else null
+        } ?: return false
+        return try {
+            if (loaded.addVoiceFile(voiceName, voiceFile)) {
+                true
+            } else {
+                lastRegistrationFailure = "کتابخانه بومی این نسخه از افزودن صدا به مدل بارگذاری‌شده پشتیبانی نمی‌کند"
+                close(kind)
+                true
+            }
+        } catch (e: Exception) {
+            // Reloading picks the file up from `voices/`, which is why this is not fatal -- but say
+            // so, because a reload of a 440 MB checkpoint is worth explaining.
+            lastRegistrationFailure = e.message ?: "افزودن صدا به مدل بارگذاری‌شده ناموفق بود"
+            close(kind)
+            true
+        }
+    }
+
     /**
      * Speaks [segments] in order, handing each piece of audio to [sink]; returning false from the
-     * sink stops there. Returns the timings of the last utterance, or null when nothing was said.
+     * sink stops early.
+     *
+     * When [exactPostProcess] is true (used for WAV export), each Persian sentence chunk is
+     * buffered for exact `speak_fa.py` runaway recovery + RMS silence trimming + 150 ms pause.
+     * When false (live streaming playback / TalkBack), audio streams immediately with online
+     * leading-silence trimming and 150 ms inter-sentence pauses.
      */
     @Synchronized
     fun speak(
@@ -80,61 +146,233 @@ class TtsEngines(context: Context) : AutoCloseable {
         temperature: Float,
         seed: Long,
         sink: (FloatArray) -> Boolean
+    ): PhononTTS.Result? = speak(segments, temperature, seed, exactPostProcess = false, sink = sink)
+
+    @Synchronized
+    fun speak(
+        segments: List<TextSegment>,
+        temperature: Float,
+        seed: Long,
+        exactPostProcess: Boolean,
+        sink: (FloatArray) -> Boolean
     ): PhononTTS.Result? {
         var last: PhononTTS.Result? = null
         val englishEngine = if (segments.any { it.isEnglish }) englishOrNull() else null
-        for (segment in segments) {
-            val useEnglish = segment.isEnglish && englishEngine != null
-            val engine = if (useEnglish) {
-                englishEngine!!
+        val faKind = activePersianKind()
+        val pauseSilence = FloatArray(PersianFrontend.PAUSE_SAMPLES)
+        var emittedAny = false
+        var stopped = false
+        val guardedSink: (FloatArray) -> Boolean = { pcm ->
+            if (stopped) {
+                false
             } else {
-                persianOrNull() ?: throw IllegalStateException(persianError ?: "مدل فارسی در دسترس نیست")
+                val keepGoing = sink(pcm)
+                if (!keepGoing) stopped = true
+                keepGoing
             }
-            configure(engine, useEnglish, temperature, seed)
-            last = engine.speak(segment.text, sink)
+        }
+
+        for (segment in segments) {
+            if (stopped) break
+            val useEnglish = segment.isEnglish && englishEngine != null
+            if (useEnglish) {
+                val eng = englishEngine!!
+                val engTemp = TtsPrefs.getTemperature(appContext, ModelKind.ENGLISH)
+                configure(eng, ModelKind.ENGLISH, engTemp, seed)
+                if (emittedAny && !guardedSink(pauseSilence)) break
+                last = eng.speak(segment.text, guardedSink)
+                emittedAny = true
+            } else {
+                val engine = persianOrNull(faKind)
+                    ?: throw IllegalStateException(persianError ?: "مدل فارسی در دسترس نیست")
+                configure(engine, faKind, temperature, seed)
+                if (faKind == ModelKind.PERSIAN) {
+                    // Cilla Mini predates the Cilla Lite frontend and was tuned against the
+                    // runtime's own text path: one segment at a time, `ptts_speak` with its
+                    // `prepare_text_prompt` (which picks three frames after EOS for short text).
+                    // Keeping that here means adding Cilla Lite does not change Mini's audio.
+                    for (chunk in TextCleaner.chunkPersian(segment.text)) {
+                        if (stopped) break
+                        if (emittedAny && !guardedSink(pauseSilence)) break
+                        last = engine.speak(chunk, guardedSink)
+                        emittedAny = true
+                    }
+                } else {
+                    val countTokens: (String) -> Int = { s ->
+                        engine.countTokens(s) ?: PersianFrontend.estimateTokens(s)
+                    }
+                    val chunks = PersianFrontend.splitSentences(
+                        PersianFrontend.withEnd(segment.text),
+                        countTokens,
+                        maxTokens = PersianFrontend.MAX_TOKENS,
+                        minTokens = PersianFrontend.MIN_TOKENS
+                    )
+                    val framesAfterEos = 0
+
+                    for (chunk in chunks) {
+                        if (stopped) break
+                        if (emittedAny && !guardedSink(pauseSilence)) break
+                        last = if (exactPostProcess) {
+                            speakPersianBuffered(engine, chunk, framesAfterEos, seed, countTokens, guardedSink)
+                        } else {
+                            speakPersianStreaming(engine, chunk, framesAfterEos, guardedSink)
+                        }
+                        emittedAny = true
+                    }
+                }
+            }
         }
         return last
     }
 
-    /** Applies the saved voice of the model behind [engine], plus the shared temperature and seed. */
-    private fun configure(engine: PhononTTS, english: Boolean, temperature: Float, seed: Long) {
+    /**
+     * Live streaming path for Persian sentences: skips dead leading silence (up to ~1.5 s) while
+     * keeping one lead-in frame (~80 ms) so onset consonants are never clipped and TTFA stays low.
+     */
+    private fun speakPersianStreaming(
+        engine: PhononTTS,
+        chunk: String,
+        framesAfterEos: Int,
+        sink: (FloatArray) -> Boolean
+    ): PhononTTS.Result {
+        var speechStarted = false
+        var skippedSamples = 0
+        var prevFrame: FloatArray? = null
+        val maxLeadSkip = (PersianFrontend.SAMPLE_RATE * 1.5).toInt()
+        val gateRms = 0.004
+
+        val res = engine.speakRaw(chunk, framesAfterEos) { pcm ->
+            if (speechStarted) {
+                sink(pcm)
+            } else {
+                val rms = frameRms(pcm)
+                if (rms >= gateRms || skippedSamples + pcm.size >= maxLeadSkip) {
+                    speechStarted = true
+                    val lead = prevFrame
+                    prevFrame = null
+                    if (lead != null && !sink(lead)) return@speakRaw false
+                    sink(pcm)
+                } else {
+                    skippedSamples += pcm.size
+                    prevFrame = pcm
+                    true
+                }
+            }
+        }
+        if (!speechStarted && prevFrame != null) {
+            sink(prevFrame!!)
+        }
+        return res
+    }
+
+    /**
+     * Exact `speak_fa.py` chunk generation: buffers one sentence chunk, detects runaway no-EOS
+     * generation (`> 0.97 * cap`), retries once with an alternate seed, then recursively halves
+     * words up to `MAX_SPLIT_DEPTH = 2`, and applies RMS silence trimming (`keepMs = 120`).
+     */
+    private fun speakPersianBuffered(
+        engine: PhononTTS,
+        chunk: String,
+        framesAfterEos: Int,
+        baseSeed: Long,
+        countTokens: (String) -> Int,
+        sink: (FloatArray) -> Boolean,
+        depth: Int = 0
+    ): PhononTTS.Result {
+        val tokens = countTokens(chunk).coerceAtLeast(1)
+
+        fun runOnce(runSeed: Long): Pair<FloatArray, PhononTTS.Result> {
+            engine.setSeed(runSeed)
+            val pieces = ArrayList<FloatArray>()
+            var total = 0
+            val r = engine.speakRaw(chunk, framesAfterEos) { pcm ->
+                pieces.add(pcm)
+                total += pcm.size
+                true
+            }
+            val merged = FloatArray(total)
+            var off = 0
+            for (p in pieces) {
+                p.copyInto(merged, off)
+                off += p.size
+            }
+            return merged to r
+        }
+
+        var (audio, result) = runOnce(baseSeed)
+        if (PersianFrontend.isRunaway(audio.size, PersianFrontend.SAMPLE_RATE, tokens)) {
+            // Retry once with a shifted seed before splitting words in half.
+            val retry = runOnce(baseSeed xor 0x5A5A_1234L)
+            audio = retry.first
+            result = retry.second
+
+            if (depth < PersianFrontend.MAX_SPLIT_DEPTH &&
+                PersianFrontend.isRunaway(audio.size, PersianFrontend.SAMPLE_RATE, tokens)
+            ) {
+                val split = PersianFrontend.splitWordsInHalf(chunk)
+                if (split != null) {
+                    val seam = FloatArray(PersianFrontend.SEAM_SAMPLES)
+                    speakPersianBuffered(
+                        engine, split.first, framesAfterEos, baseSeed, countTokens, sink, depth + 1
+                    )
+                    if (!sink(seam)) return result
+                    return speakPersianBuffered(
+                        engine, split.second, framesAfterEos, baseSeed + 1, countTokens, sink, depth + 1
+                    )
+                }
+            }
+        }
+
+        val trimmed = PersianFrontend.trimSilence(audio, PersianFrontend.SAMPLE_RATE, 120f)
+        if (trimmed.isNotEmpty()) sink(trimmed)
+        return result
+    }
+
+    private fun frameRms(pcm: FloatArray): Double {
+        if (pcm.isEmpty()) return 0.0
+        var sumSq = 0.0
+        for (s in pcm) sumSq += s.toDouble() * s.toDouble()
+        return sqrt(sumSq / pcm.size.toDouble())
+    }
+
+    /** Applies the saved voice of [kind], plus temperature and seed. */
+    private fun configure(engine: PhononTTS, kind: ModelKind, temperature: Float, seed: Long) {
         val available = try {
             engine.voices
         } catch (_: Exception) {
             emptyList()
         }
-        val wanted = if (english) {
-            TtsPrefs.getEnglishVoice(appContext)
-        } else {
-            TtsPrefs.getPersianVoice(appContext)
-        }
+        val wanted = TtsPrefs.getVoice(appContext, kind)
         val voice = wanted?.takeIf { available.contains(it) } ?: available.firstOrNull()
         if (voice != null) {
             try {
                 engine.setVoice(voice)
-                if (english) TtsPrefs.setEnglishVoice(appContext, voice) else TtsPrefs.setPersianVoice(appContext, voice)
+                TtsPrefs.setVoice(appContext, kind, voice)
             } catch (_: Exception) {
-                // A voice name the engine does not know is not worth failing the utterance for.
+                // Keep going with the model's current default voice.
             }
         }
-        engine.setLanguage(if (english) LANGUAGE_ENGLISH else LANGUAGE_PERSIAN)
+        engine.setLanguage(if (kind == ModelKind.ENGLISH) LANGUAGE_ENGLISH else LANGUAGE_PERSIAN)
         engine.setTemperature(temperature)
         engine.setSeed(seed)
     }
 
-    /** Releases [kind]'s model, so its files can be replaced or deleted. */
+    /** Releases [kind]'s model so its files can be replaced or deleted. */
     @Synchronized
     fun close(kind: ModelKind) {
         when (kind) {
-            ModelKind.PERSIAN -> {
-                persian?.close()
-                persian = null
-                persianError = null
-            }
             ModelKind.ENGLISH -> {
                 english?.close()
                 english = null
                 englishError = null
+            }
+            ModelKind.PERSIAN, ModelKind.PERSIAN_LITE -> {
+                if (persianKindLoaded == kind) {
+                    persian?.close()
+                    persian = null
+                    persianKindLoaded = null
+                    persianError = null
+                }
             }
         }
     }
@@ -143,12 +381,13 @@ class TtsEngines(context: Context) : AutoCloseable {
     override fun close() {
         persian?.close()
         persian = null
+        persianKindLoaded = null
         english?.close()
         english = null
     }
 
     companion object {
-        /** Cilla is Persian only, and the runtime has no Persian normalizer: read it as written. */
+        /** Persian models use our Kotlin PersianFrontend; disable xn-ptts's non-Persian normalizer. */
         const val LANGUAGE_PERSIAN = "none"
         const val LANGUAGE_ENGLISH = "en"
     }

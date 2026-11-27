@@ -13,7 +13,7 @@
     <TextView
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:text="سیلا مینی — تبدیل متن به گفتار"
+        android:text="سیلا — تبدیل متن به گفتار"
         android:textSize="22sp"
         android:textStyle="bold" />
 
@@ -68,7 +68,7 @@
                     android:gravity="top|start"
                     android:inputType="textMultiLine"
                     android:minLines="4"
-                    android:text="سلام! این صدای مدل سیلا مینی روی گوشی شماست." />
+                    android:text="سلام! این صدای مدل سیلا روی گوشی شماست." />
             </com.google.android.material.textfield.TextInputLayout>
 
             <com.google.android.material.button.MaterialButton
@@ -99,6 +99,36 @@
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="12dp"
+                android:text="مدل فارسی فعال"
+                android:textStyle="bold" />
+
+            <RadioGroup
+                android:id="@+id/persianModelGroup"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:orientation="horizontal">
+
+                <RadioButton
+                    android:id="@+id/radioCillaMini"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="سیلا مینی (سریع)" />
+
+                <RadioButton
+                    android:id="@+id/radioCillaLite"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="سیلا لایت (باکیفیت)" />
+            </RadioGroup>
+
+            <TextView
+                android:id="@+id/voiceFaLabel"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
                 android:text="گوینده فارسی"
                 android:textStyle="bold" />
 
@@ -112,7 +142,7 @@
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="12dp"
-                android:text="گوینده انگلیسی"
+                android:text="گوینده انگلیسی (Phonon)"
                 android:textStyle="bold" />
 
             <Spinner
@@ -198,11 +228,12 @@
             android:orientation="vertical"
             android:paddingBottom="24dp">
 
+            <!-- Cilla Mini -->
             <TextView
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="4dp"
-                android:text="مدل فارسی (Cilla)"
+                android:text="مدل فارسی سریع — سیلا مینی (Cilla Mini)"
                 android:textSize="16sp"
                 android:textStyle="bold" />
 
@@ -211,7 +242,7 @@
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="8dp"
-                android:text="دانلود مدل فارسی" />
+                android:text="دانلود سیلا مینی (~۱۱۲ مگابایت)" />
 
             <com.google.android.material.button.MaterialButton
                 android:id="@+id/selectFaFolderButton"
@@ -219,7 +250,7 @@
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="6dp"
-                android:text="انتخاب پوشه مدل فارسی" />
+                android:text="انتخاب پوشه سیلا مینی" />
 
             <TextView
                 android:id="@+id/modelFaStatus"
@@ -235,11 +266,96 @@
                 android:layout_marginTop="16dp"
                 android:background="?android:attr/listDivider" />
 
+            <!-- Cilla Lite -->
             <TextView
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="12dp"
-                android:text="مدل انگلیسی (Phonon)"
+                android:text="مدل فارسی باکیفیت — سیلا لایت (Cilla Lite 100M)"
+                android:textSize="16sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="2dp"
+                android:text="مدل ۱۰۰ میلیونی mehdi-hf/cilla-lite با کیفیت طبیعی‌تر و کلون صدا. تبدیل config.yaml و tokenizer.model به‌صورت خودکار روی گوشی انجام می‌شود."
+                android:textSize="12sp" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/downloadLiteButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="دانلود سیلا لایت با توکن HF (~۴۴۰ مگابایت)" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/selectLiteFolderButton"
+                style="@style/Widget.Material3.Button.OutlinedButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:text="انتخاب پوشه سیلا لایت" />
+
+            <TextView
+                android:id="@+id/modelLiteStatus"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:text="بررسی نشده"
+                android:textSize="12sp" />
+
+            <View
+                android:layout_width="match_parent"
+                android:layout_height="1dp"
+                android:layout_marginTop="16dp"
+                android:background="?android:attr/listDivider" />
+
+            <!-- Voice Cloning -->
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:text="کلون صدا (Voice Cloning)"
+                android:textSize="16sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/cloneStatusText"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="2dp"
+                android:text="از روی ۳ تا ۱۰ ثانیه صدای نمونه (میکروفون یا فایل صوتی) گوینده اختصاصی برای سیلا لایت یا سیلا مینی بسازید."
+                android:textSize="12sp" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/cloneRecordButton"
+                style="@style/Widget.Material3.Button.TonalButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="🎙 ضبط صدا با میکروفون برای کلون" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/clonePickFileButton"
+                style="@style/Widget.Material3.Button.OutlinedButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:text="📁 انتخاب فایل صوتی (WAV/MP3/M4A/OGG) برای کلون" />
+
+            <View
+                android:layout_width="match_parent"
+                android:layout_height="1dp"
+                android:layout_marginTop="16dp"
+                android:background="?android:attr/listDivider" />
+
+            <!-- English Phonon -->
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:text="مدل انگلیسی (Phonon 31M)"
                 android:textSize="16sp"
                 android:textStyle="bold" />
 
@@ -249,6 +365,14 @@
                 android:layout_height="wrap_content"
                 android:layout_marginTop="8dp"
                 android:text="دانلود مدل انگلیسی" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/downloadPhononVoicesButton"
+                style="@style/Widget.Material3.Button.TonalButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:text="دانلود صداهای انگلیسی (Phonon Voices)" />
 
             <com.google.android.material.button.MaterialButton
                 android:id="@+id/selectEnFolderButton"
@@ -272,11 +396,12 @@
                 android:layout_marginTop="16dp"
                 android:background="?android:attr/listDivider" />
 
+            <!-- Voices management -->
             <TextView
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="12dp"
-                android:text="صداها (Voices)"
+                android:text="مدیریت صداها (Voices)"
                 android:textSize="16sp"
                 android:textStyle="bold" />
 
@@ -284,7 +409,7 @@
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="2dp"
-                android:text="هر فایل صدای انتخاب‌شده به‌طور خودکار در مدل سازگار خودش (فارسی یا انگلیسی) قرار می‌گیرد."
+                android:text="هر فایل safetensors به‌طور خودکار در مدل سازگار خودش (سیلا مینی، سیلا لایت یا فونون) قرار می‌گیرد."
                 android:textSize="12sp" />
 
             <com.google.android.material.button.MaterialButton
@@ -293,7 +418,7 @@
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="6dp"
-                android:text="انتخاب پوشه صدا" />
+                android:text="انتخاب پوشه صدا (safetensors)" />
 
             <com.google.android.material.button.MaterialButton
                 android:id="@+id/deleteVoicesButton"
@@ -301,7 +426,7 @@
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="6dp"
-                android:text="حذف صداها" />
+                android:text="حذف همه صداها" />
 
             <View
                 android:layout_width="match_parent"
@@ -358,7 +483,7 @@
                 android:layout_height="wrap_content"
                 android:layout_marginTop="4dp"
                 android:lineSpacingExtra="3dp"
-                android:text="مدل فارسی Cilla (huggingface.co/spaces/mehdi-hf/cilla-mini-demo) توسط Oncilla AI (oncillaai.com)\nNon-commercial model (CC BY-NC 4.0)\n\nمدل انگلیسی Phonon (huggingface.co/gradium/phonon-31m-en) توسط Gradium (gradium.ai)\nApache 2.0\n\nموتور اجرا: xn-ptts (github.com/gradium-ai/xn-ptts)"
+                android:text="مدل‌های فارسی Cilla Mini و Cilla Lite (huggingface.co/mehdi-hf/cilla-lite) توسط Oncilla AI (oncillaai.com)\nNon-commercial model (CC BY-NC 4.0)\n\nمدل انگلیسی Phonon و مجموعه صداهای Phonon Voices (huggingface.co/gradium/phonon-voices) توسط Gradium (gradium.ai)\nApache 2.0\n\nموتور اجرا: xn-ptts (github.com/gradium-ai/xn-ptts)"
                 android:textSize="12sp" />
         </LinearLayout>
     </ScrollView>

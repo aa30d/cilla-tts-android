@@ -55,15 +55,57 @@ class VoiceFileInfo(
 class ModelProfile(val config: JSONObject) {
 
     /**
-     * Channels the checkpoint's speaker projection takes: `speaker_mimi.mimi.inner_dim` when the
-     * checkpoint has one, otherwise that Mimi's `dimension` (`encoder_latent_dim` in xn-ptts).
-     * Null when the config has no `speaker_mimi`, in which case nothing is checked.
+     * Channels the checkpoint's speaker projection takes, mirroring `speaker_mimi_cfg()`
+     * (`encoder_latent_dim()` = `inner_dim ?: dimension`): the separate speaker Mimi when the
+     * config has one, otherwise the main codec's, and `inner_dim` before `dimension` because
+     * `dimension` is the SEANet width (512 for Cilla), not the latent width.
+     *
+     * For every config this app handles this picks the same value as the `speaker_mimi ?: mimi`
+     * form it replaces -- Cilla Mini and Lite both set `inner_dim`. The difference is the
+     * degenerate case: a `speaker_mimi` block without a `mimi` inside now yields null ("nothing
+     * to check against") instead of silently reading the main codec's width.
      */
     val latentChannels: Int? = run {
-        val mimi = config.optJSONObject("speaker_mimi")?.optJSONObject("mimi") ?: return@run null
+        val speakerMimi = config.optJSONObject("speaker_mimi")?.optJSONObject("mimi")
+        if (speakerMimi != null) {
+            val inner = speakerMimi.optInt("inner_dim", 0)
+            if (inner > 0) return@run inner
+            return@run speakerMimi.optInt("dimension", 0).takeIf { it > 0 }
+        }
+        val mimi = config.optJSONObject("mimi") ?: return@run null
         val inner = mimi.optInt("inner_dim", 0)
         if (inner > 0) inner else mimi.optInt("dimension", 0).takeIf { it > 0 }
     }
+
+    /**
+     * True when the config describes a speaker encoder at all (a `mimi`, or a separate
+     * `speaker_mimi.mimi`).
+     *
+     * This is a shape check on `config.json`, not proof that the weights contain the encoder --
+     * every valid config names a `mimi`, so it is true for almost everything. Ask the weights:
+     * `ModelStorage.cloneUnavailableReason` looks for `flow_lm.speaker_proj_weight` in the
+     * safetensors header, which is what `Synth::prime` needs.
+     */
+    val hasSpeakerEncoder: Boolean = run {
+        val speaker = config.optJSONObject("speaker_mimi")
+        if (speaker != null) return@run true
+        config.optJSONObject("mimi") != null
+    }
+
+    /** The checkpoint's `audio_prompt_min_duration`, or null when it does not say. */
+    val promptMinSeconds: Double? = config.optDouble("audio_prompt_min_duration", Double.NaN)
+        .takeIf { it.isFinite() && it > 0 }
+
+    /** The checkpoint's `audio_prompt_max_duration`, or null when it does not say. */
+    val promptMaxSeconds: Double? = config.optDouble("audio_prompt_max_duration", Double.NaN)
+        .takeIf { it.isFinite() && it > 0 }
+
+    /**
+     * True when the checkpoint expects a `speaker_wavs` prefix sink (Cilla Lite ships
+     * `flow_lm.bos_before_voice` for it), which is what the patched loader maps that tensor onto.
+     */
+    val hasSpeakerSink: Boolean =
+        config.optJSONObject("prefix_sinks")?.has("speaker_wavs") == true
 
     /** Width of a precomputed voice embedding: the flow LM's `d_model`. */
     val embWidth: Int? = config.optJSONObject("flow_lm")
@@ -154,6 +196,17 @@ object VoiceCompat {
             }
         }
         return null
+    }
+
+    /**
+     * The tensor names a safetensors file holds, metadata excluded. Empty when the file is not one
+     * or its header cannot be read; callers treat that as "nothing to check".
+     */
+    fun tensorNames(file: File): Set<String> = try {
+        val header = readHeader(file)
+        header.keys().asSequence().filter { it != "__metadata__" }.toSet()
+    } catch (_: Exception) {
+        emptySet()
     }
 
     /** The JSON header of a safetensors file: an 8-byte little-endian length, then that many bytes. */

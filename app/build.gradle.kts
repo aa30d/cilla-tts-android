@@ -11,8 +11,8 @@ android {
         applicationId = "com.cilla.tts"
         minSdk = 26
         targetSdk = 35
-        versionCode = providers.gradleProperty("versionCode").orElse("3").get().toInt()
-        versionName = providers.gradleProperty("versionName").orElse("1.1.1").get()
+        versionCode = providers.gradleProperty("versionCode").orElse("4").get().toInt()
+        versionName = providers.gradleProperty("versionName").orElse("1.2.0").get()
 
         ndk {
             abiFilters += listOf("arm64-v8a", "x86_64")
@@ -48,6 +48,24 @@ android {
         abortOnError = false
     }
 }
+
+/**
+ * The prebuilt `libptts_ffi.so` files are not committed (see `.gitignore`): they are built by
+ * `native/build-ptts-ffi.sh`, locally or in CI. Their symbol manifest records what the Kotlin code
+ * calls, so a library left over from an older build fails here with an actionable message instead
+ * of throwing `FunctionNotFoundException` on a device.
+ */
+val checkPttsFfi by tasks.registering(Exec::class) {
+    group = "verification"
+    description = "Checks app/src/main/jniLibs/libptts_ffi.so against its symbol manifest"
+    // Absolute, from `rootDir`: a task in the `app` module starts in `app/`, not in the root.
+    val script = File(rootDir, "native/check-ptts-ffi.py")
+    val jniLibs = File(rootDir, "app/src/main/jniLibs")
+    commandLine("python3", script.absolutePath, jniLibs.absolutePath)
+}
+
+tasks.matching { it.name.startsWith("merge") && it.name.endsWith("JniLibFolders") }
+    .configureEach { dependsOn(checkPttsFfi) }
 
 dependencies {
     implementation("androidx.core:core-ktx:1.15.0")

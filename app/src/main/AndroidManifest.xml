@@ -2,6 +2,7 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
 
     <!-- Saving a WAV into Downloads needs this on Android 9 and older; from 10 the media store
          handles it without a permission. -->
@@ -12,7 +13,7 @@
     <application
         android:allowBackup="true"
         android:icon="@mipmap/ic_launcher"
-        android:label="سیلا مینی (TTS)"
+        android:label="سیلا (Cilla TTS)"
         android:supportsRtl="true"
         android:theme="@style/Theme.Material3.DayNight.NoActionBar">
         <activity
@@ -27,7 +28,7 @@
         <service
             android:name=".CillaTtsService"
             android:exported="true"
-            android:label="سیلا مینی (Cilla Mini TTS)">
+            android:label="سیلا (Cilla TTS)">
             <intent-filter>
                 <action android:name="android.intent.action.TTS_SERVICE" />
                 <category android:name="android.intent.category.DEFAULT" />
