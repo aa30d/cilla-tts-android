@@ -385,10 +385,10 @@ index d250337..ce2c02e 100644
  
  #[cfg(test)]
 diff --git a/ptts-ffi/src/lib.rs b/ptts-ffi/src/lib.rs
-index 45c4832..94ac921 100644
+index 45c4832..acb6ecd 100644
 --- a/ptts-ffi/src/lib.rs
 +++ b/ptts-ffi/src/lib.rs
-@@ -274,6 +274,308 @@ pub unsafe extern "C" fn ptts_free(h: *mut PttsHandle) {
+@@ -274,6 +274,310 @@ pub unsafe extern "C" fn ptts_free(h: *mut PttsHandle) {
      }
  }
  
@@ -658,7 +658,9 @@ index 45c4832..94ac921 100644
 +    match r {
 +        Ok((ok_names, failures)) => {
 +            for (name, reason) in &failures {
-+                tracing::warn!("voice {name} was not written: {reason}");
++                // `ptts-ffi` has no logger of its own (it is a C ABI, not a library with a
++                // subscriber), so a per-voice failure goes to stderr, which Android logs.
++                eprintln!("ptts: voice {name} was not written: {reason}");
 +            }
 +            unsafe { *written = ok_names.len() as u32 };
 +            if !failed.is_null() {
