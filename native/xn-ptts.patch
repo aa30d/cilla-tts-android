@@ -385,7 +385,7 @@ index d250337..ce2c02e 100644
  
  #[cfg(test)]
 diff --git a/ptts-ffi/src/lib.rs b/ptts-ffi/src/lib.rs
-index 45c4832..acb6ecd 100644
+index 45c4832..0f9c2b6 100644
 --- a/ptts-ffi/src/lib.rs
 +++ b/ptts-ffi/src/lib.rs
 @@ -274,6 +274,310 @@ pub unsafe extern "C" fn ptts_free(h: *mut PttsHandle) {
@@ -550,6 +550,8 @@ index 45c4832..acb6ecd 100644
 +    let output_path = unsafe { CStr::from_ptr(output_path) }.to_string_lossy().to_string();
 +    let pcm = unsafe { std::slice::from_raw_parts(pcm, n_samples) };
 +    #[cfg(not(target_vendor = "apple"))]
++    // `(frames, dim)`, not `cpu::CloneInfo`: the `cpu` module does not exist on Apple targets, so
++    // naming its type here would break the Core ML build.
 +    let r = guarded(|| {
 +        cpu::clone_voice_to_file(
 +            Path::new(&model_dir),
@@ -558,22 +560,20 @@ index 45c4832..acb6ecd 100644
 +            Path::new(&output_path),
 +            normalize_loudness,
 +        )
++        .map(|info| (info.frames, info.dim))
 +    });
 +    #[cfg(target_vendor = "apple")]
-+    let r: Result<(), String> = {
++    let r: Result<(usize, usize), String> = {
 +        let _ = (model_dir, output_path, pcm, sample_rate, normalize_loudness, frames, dim);
 +        Err("ptts_clone_voice_to_file is only supported on CPU".to_string())
 +    };
 +    match r {
-+        Ok(()) => {
-+            #[cfg(not(target_vendor = "apple"))]
-+            {
-+                if !frames.is_null() {
-+                    unsafe { *frames = info.frames as u32 };
-+                }
-+                if !dim.is_null() {
-+                    unsafe { *dim = info.dim as u32 };
-+                }
++        Ok((info_frames, info_dim)) => {
++            if !frames.is_null() {
++                unsafe { *frames = info_frames as u32 };
++            }
++            if !dim.is_null() {
++                unsafe { *dim = info_dim as u32 };
 +            }
 +            true
 +        }
