@@ -20,3 +20,7 @@ native/.cache/
 # committed: a checked-in binary drifts from the Kotlin that calls it, and GitHub Actions only
 # overwrites it after it has checked it out. The symbol manifest next to it stays tracked.
 app/src/main/jniLibs/*/libptts_ffi.so
+
+# Python bytecode from native/check-*.py
+__pycache__/
+*.pyc

@@ -63,9 +63,11 @@ Upstream `xn-ptts` is extended via `native/xn-ptts.patch` to support:
 
 `libptts_ffi.so` is **not** checked in: it is built into `app/src/main/jniLibs/{arm64-v8a,x86_64}`
 by `native/build-ptts-ffi.sh` (locally, and in GitHub Actions on every run). The script also writes
-`app/src/main/jniLibs/ptts-ffi.symbols`, and `native/check-ptts-ffi.py` — run by `gradlew` and
-`build.sh` — fails the build when the library in place is missing a symbol the app calls, so an APK
-can no longer ship a `libptts_ffi.so` from an older build that silently lacks `ptts_speak_raw`.
+`app/src/main/jniLibs/ptts-ffi.symbols`, and `native/check-ptts-ffi.py` — run by the
+`:app:checkPttsFfi` Gradle task and by `build.sh` — fails the build when the library in place does
+not export a symbol the app calls, so an APK can no longer ship a `libptts_ffi.so` from an older
+build that silently lacks `ptts_speak_raw`. It reads the ELF dynamic symbol table rather than
+searching the file for the name, so a string literal or a debug entry cannot satisfy it.
 `native/check-patch.sh` confirms the patch still applies to the pinned upstream commit.
 
 To build the patched native libraries locally (requires Rust + `cargo-ndk` + Android NDK):

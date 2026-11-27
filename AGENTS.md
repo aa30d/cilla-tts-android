@@ -5,8 +5,12 @@
 - **Native library**: `libptts_ffi.so`, built from `gradium-ai/xn-ptts` **plus `native/xn-ptts.patch`** (loaded via JNA in `PhononTTS.kt`). ABIs: `arm64-v8a`, `x86_64`.
 - **The library is not committed.** `native/build-ptts-ffi.sh` builds it (locally or in CI) into
   `app/src/main/jniLibs/`, together with the `ptts-ffi.symbols` manifest that
-  `native/check-ptts-ffi.py` checks it against — `gradlew` and `build.sh` both run that check, so a
-  stale library fails the build instead of throwing `FunctionNotFoundException` on a device.
+  `native/check-ptts-ffi.py` checks it against — the `:app:checkPttsFfi` Gradle task (hooked to
+  `merge*JniLibFolders`) and `build.sh` both run that check, so a stale library fails the APK build
+  instead of throwing `FunctionNotFoundException` on a device. The generated `gradlew` is left
+  alone: guarding it broke `./gradlew clean` and `--version`, and an upgrade would drop the edit.
+  The check compares *dynamic* ELF symbols (`readelf --dyn-syms`, or the headers in plain Python),
+  not bytes in the file.
   `native/check-patch.sh` verifies the patch still applies to the pinned upstream commit.
 - **Three checkpoints, three folders**: Cilla Mini in `filesDir/model`, Cilla Lite in
   `filesDir/model_lite`, Phonon (English) in `filesDir/model_en`. Each keeps its own `voices/`
@@ -45,15 +49,21 @@ Error in Loading Model ... /voices/Easton.safetensors has 512 channels but the s
   `Synth::prime` needs for guided generation). It reads `model.safetensors`, never `model.q8.gguf`:
   `quantize --no-mimi-encoder` drops the encoder.
 - `ModelStorage.canCloneVoices` / `cloneUnavailableReason` are the single answer to "can this model
-  clone now": Persian, f32 weights present, `VoiceCompat.ModelProfile.hasSpeakerEncoder`, and
+  clone now": Persian, f32 weights present, `flow_lm.speaker_proj_weight` **in the safetensors
+  header** (not merely a `mimi` block in the config, which every config has), and
   `PhononTTS.hasVoicePromptFfi`. Keep them in step with what the native code actually needs.
 - Prompt length bounds come from the checkpoint (`audio_prompt_min_duration` /
-  `audio_prompt_max_duration`, surfaced through `ModelProfile.promptMinSeconds/MaxSeconds`);
-  `CillaLiteConverter` copies them into `config.json` and `AudioDecoder.validateAndTrimPrompt`
-  trims with the same numbers. Do not hardcode 1..30 s.
-- A cloned file carries `model_ext` (`sig@epoch`) from the config's `model_id`, which
-  `CillaLiteConverter` now writes; without it the loader cannot tell which checkpoint made the
-  voice and `embeddings_ext` checks silently pass.
+  `audio_prompt_max_duration`, surfaced through `ModelProfile.promptMinSeconds/MaxSeconds`) but
+  are clamped by `AudioDecoder.clampPromptBounds` (0.5–10 s minimum, 5–30 s maximum), which
+  mirrors `prompt_bounds` in the native patch. Cilla Mini says 10 s for both, which is its
+  *training* prompt length and would refuse a 3-second recording; cloning is not training. The
+  clamp drives the native trim, `validateAndTrimPrompt`, the clone hint and the record dialog's
+  save gate, so they cannot disagree.
+- `CillaLiteConverter` deliberately writes `model_id: null`: `TTSConfig::default_gelu` selects
+  `Gelu::Tanh` exactly when `model_id` is absent (Pocket TTS, which Cilla Lite distils), and
+  `model_id` is only read back through `embeddings_ext`, which no Cilla config sets. A cloned file
+  therefore carries no `model_ext`, and `xn-ptts` accepts untagged files (older voices predate the
+  metadata). Do not "fix" this by inventing a `model_id`.
 - Registering a **new** voice on an engine that is already loaded can fail (`add_voice_file`
   refuses checkpoints with `voices[].conditions`, i.e. baked-in voices, once guidance is on). The
   engine is then closed so the next load picks the file up;

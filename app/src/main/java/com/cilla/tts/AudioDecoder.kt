@@ -31,6 +31,18 @@ object AudioDecoder {
 
     const val TARGET_SAMPLE_RATE = 24000
     const val MIN_PROMPT_SECONDS = 1.0f
+
+    /**
+     * A checkpoint's `audio_prompt_*_duration` held to what a person can record, matching
+     * `prompt_bounds` in the native patch (`native/xn-ptts.patch`, `cpu.rs`). Cilla Mini's config
+     * says 10 s for both, which is its training prompt length, not a recording requirement; the
+     * native clone uses these clamped values, so the trim here must too.
+     */
+    fun clampPromptBounds(minSeconds: Double, maxSeconds: Double): Pair<Float, Float> {
+        val min = minSeconds.toFloat().coerceIn(0.5f, 10f)
+        val max = maxSeconds.toFloat().coerceIn(5f, 30f).coerceAtLeast(min)
+        return min to max
+    }
     const val MAX_PROMPT_SECONDS = 30.0f
 
     data class DecodedAudio(
@@ -74,6 +86,7 @@ object AudioDecoder {
         minSeconds: Float = MIN_PROMPT_SECONDS,
         maxSeconds: Float = MAX_PROMPT_SECONDS
     ): FloatArray {
+        val (minSeconds, maxSeconds) = clampPromptBounds(minSeconds.toDouble(), maxSeconds.toDouble())
         val minSamples = (sampleRate * minSeconds).toInt()
         if (pcm.size < minSamples) {
             val secs = pcm.size.toFloat() / sampleRate

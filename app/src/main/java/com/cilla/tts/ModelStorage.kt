@@ -99,10 +99,25 @@ object ModelStorage {
         if (!File(dir, "model.safetensors").isFile) {
             return "مدل ${kind.label} وزن f32 (model.safetensors) ندارد، پس نمی‌تواند صدا کلون کند"
         }
-        if (ModelProfile.load(dir)?.hasSpeakerEncoder != true) {
+        // The config alone cannot answer this: every valid config names a `mimi`, whether or not
+        // the checkpoint kept its speaker projection. A quantized GGUF written with
+        // `--no-mimi-encoder` has none, so the weight itself is the evidence.
+        if (!hasSpeakerProjection(File(dir, "model.safetensors"))) {
             return "این نسخه از مدل ${kind.label} رمزگذار گوینده (speaker encoder) ندارد"
         }
         return null
+    }
+
+    /**
+     * True when [weights] holds the speaker projection `Synth::prime` requires for cloning
+     * (either name the loaders accept), i.e. the encoder was not stripped when it was written.
+     */
+    private fun hasSpeakerProjection(weights: File): Boolean {
+        val names = VoiceCompat.tensorNames(weights)
+        return names.any {
+            it == "flow_lm.speaker_proj_weight" ||
+                it == "flow_lm.condition_provider.conditioners.speaker_wavs.output_proj.weight"
+        }
     }
 
     /**
@@ -112,9 +127,10 @@ object ModelStorage {
      */
     fun promptDurationBounds(ctx: Context, kind: ModelKind): Pair<Float, Float> {
         val profile = ModelProfile.load(modelDir(ctx, kind))
-        val min = profile?.promptMinSeconds?.toFloat()?.coerceIn(0.5f, 10f) ?: 1.0f
-        val max = profile?.promptMaxSeconds?.toFloat()?.coerceIn(5f, 60f) ?: 30.0f
-        return if (max <= min) min to (min + 1f) else min to max
+        return AudioDecoder.clampPromptBounds(
+            profile?.promptMinSeconds ?: AudioDecoder.MIN_PROMPT_SECONDS.toDouble(),
+            profile?.promptMaxSeconds ?: AudioDecoder.MAX_PROMPT_SECONDS
+        )
     }
 
     /** Every voice file of a checkpoint, as the loader scans them: the safetensors in `voices/`, plus a root `default-voice.safetensors`. */
@@ -254,26 +270,14 @@ object ModelStorage {
             prompts.mkdirs()
             for (doc in promptAudioDocs) {
                 val fileName = doc.name ?: continue
-                val destPrompt = File(prompts, fileName)
                 onStatus("در حال کپی فایل نمونه $fileName...")
-                copyDoc(ctx, doc, destPrompt)
-                val stem = sanitizeVoiceName(fileName.substringBeforeLast('.'))
-                val voiceOut = File(voices, "$stem.safetensors")
-                if (!voiceOut.isFile && PhononTTS.hasVoiceCloningFfi && File(target, "model.safetensors").isFile) {
-                    onStatus("در حال ساخت بردار صدای $stem...")
-                    try {
-                        val pcm = AudioDecoder.decodeFileToMono24k(destPrompt)
-                        PhononTTS.cloneVoiceToFile(
-                            modelDir = target,
-                            pcm = pcm,
-                            sampleRate = AudioDecoder.TARGET_SAMPLE_RATE,
-                            outputFile = voiceOut,
-                            normalizeLoudness = false
-                        )
-                    } catch (_: Exception) {
-                        // Keep the copied prompt file; user can retry or inspect error when cloning.
-                    }
-                }
+                copyDoc(ctx, doc, File(prompts, fileName))
+            }
+            // One batch call after the copies, not one native call per file: each call loads the
+            // checkpoint's ~440 MB of weights, and a per-file `catch (_: Exception)` hid every
+            // failure. `encodePendingPrompts` reports what it could not encode.
+            if (File(target, "model.safetensors").isFile) {
+                encodePendingPrompts(ctx, kind, onStatus)
             }
         }
 
@@ -351,11 +355,21 @@ object ModelStorage {
         if (pending.isEmpty()) return 0
 
         onStatus("در حال استخراج ${pending.size} بردار صدا (یک‌بار بارگذاری وزن‌ها)...")
+        // Trim here, per file, with the checkpoint's bounds: the native batch call rejects a
+        // prompt under `audio_prompt_min_duration` without saying which one, while
+        // `validateAndTrimPrompt` names it and the file it came from.
+        val (minSeconds, maxSeconds) = promptDurationBounds(ctx, kind)
         val decoded = mutableListOf<Pair<String, FloatArray>>()
         val undecodable = mutableListOf<Pair<String, String>>()
         for ((stem, file) in pending) {
             try {
-                decoded += stem to AudioDecoder.decodeFileToMono24k(file)
+                val pcm = AudioDecoder.decodeFileToMono24k(file)
+                decoded += stem to AudioDecoder.validateAndTrimPrompt(
+                    pcm,
+                    AudioDecoder.TARGET_SAMPLE_RATE,
+                    minSeconds = minSeconds,
+                    maxSeconds = maxSeconds
+                )
             } catch (e: Exception) {
                 undecodable += stem to (e.message ?: "فایل صوتی خوانده نشد")
             }
@@ -381,9 +395,7 @@ object ModelStorage {
         pcm: FloatArray
     ): Pair<String, File> {
         val dir = modelDir(ctx, kind)
-        if (!canCloneVoices(ctx, kind)) {
-            throw IllegalStateException("مدل ${kind.label} از کلون صدا پشتیبانی نمی‌کند یا فایل model.safetensors ندارد")
-        }
+        cloneUnavailableReason(ctx, kind)?.let { throw IllegalStateException(it) }
         val safeName = sanitizeVoiceName(rawName)
         val (minSeconds, maxSeconds) = promptDurationBounds(ctx, kind)
         val validated = AudioDecoder.validateAndTrimPrompt(

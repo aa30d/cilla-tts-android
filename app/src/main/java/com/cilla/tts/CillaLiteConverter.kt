@@ -107,9 +107,11 @@ object CillaLiteConverter {
 
         // Auto-verify subtle weight-dependent parameters against the safetensors header if present.
         if (safetensorsHeader != null) {
+            // `flow_lm.fuser.padding_value` is a scalar, not a sink: a checkpoint can carry it
+            // without any speaker conditioning, and declaring the sink for one would produce a
+            // config that `ModelStorage.configMismatch` then refuses. Only real sink tokens count.
             val hasSinkTensor =
                 safetensorsHeader.has("flow_lm.bos_before_voice") ||
-                    safetensorsHeader.has("flow_lm.fuser.padding_value") ||
                     safetensorsHeader.has("flow_lm.condition_provider.conditioners.speaker_wavs.sink")
             insertBosBeforeVoice = hasSinkTensor
 
@@ -145,11 +147,13 @@ object CillaLiteConverter {
         val eosThreshold = getDouble("eos_threshold", -2.0)
         val minPrompt = getDouble("audio_prompt_min_duration", 1.0)
         val maxPrompt = getDouble("audio_prompt_max_duration", 30.0)
-        // The runtime names a checkpoint by `model_id` and derives `model_ext` ("sig@epoch") from
-        // it; the loader writes that into every voice file it clones, and refuses a file tagged
-        // for another checkpoint. Leaving it null silently drops the tag (see `clone_voice_to_file`).
-        val modelSig = getStr("model_id.sig", getStr("model_id", ""))
-        val modelEpoch = getInt("model_id.epoch", 0)
+        // `model_id` stays null, as 1.2 shipped it, for two reasons found in `ptts::tts_model`:
+        // `TTSConfig::default_gelu` picks `Gelu::Tanh` exactly when `model_id` is absent (Pocket TTS,
+        // which Cilla Lite is distilled from, is Tanh), so inventing one changes the activation the
+        // Mimi encoder and flow LM run with; and `model_id` is only read back through
+        // `embeddings_ext`, which no Cilla config sets, so a tag would never be checked against a
+        // voice file anyway. A checkpoint that genuinely carries one keeps it in its config.yaml,
+        // which is copied verbatim.
 
         val flowLmJson = JSONObject()
             .put("d_model", dModel)
@@ -196,21 +200,13 @@ object CillaLiteConverter {
             mimiJson.put("inner_dim", innerDim)
         }
 
-        // A separate `speaker_mimi` block only when the codec's encoder is a different one; when
-        // `mimi.inner_dim` is set the same Mimi encodes prompts, and `speaker_mimi_cfg()` reads
-        // `mimi` -- which is what `VoiceCompat.ModelProfile` expects to decide what fits.
-        val modelIdJson = if (modelSig.isNotEmpty()) {
-            JSONObject().put("sig", modelSig).put("epoch", modelEpoch)
-        } else {
-            null
-        }
-
         val root = JSONObject()
             .put("flow_lm", flowLmJson)
             .put("mimi", mimiJson)
             .put("lsd_decode_steps", 1)
             .put("eos_threshold", eosThreshold)
-            .put("model_id", modelIdJson ?: JSONObject.NULL)
+            // Null on purpose: see the `model_id` note at the top of this function.
+            .put("model_id", JSONObject.NULL)
             .put("audio_prompt_min_duration", minPrompt)
             .put("audio_prompt_max_duration", maxPrompt)
             .put("cfg_null_audio_empty", true)

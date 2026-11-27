@@ -72,7 +72,7 @@ index ae00d1c..2331a04 100644
 +void ptts_strings_free(char *s);
  #endif
 diff --git a/ptts-ffi/src/cpu.rs b/ptts-ffi/src/cpu.rs
-index d250337..ce2c02e 100644
+index d250337..62f4ff3 100644
 --- a/ptts-ffi/src/cpu.rs
 +++ b/ptts-ffi/src/cpu.rs
 @@ -6,10 +6,15 @@
@@ -145,7 +145,7 @@ index d250337..ce2c02e 100644
      /// Switch to one of [`Self::voices`].
      pub fn set_voice(&mut self, name: &str) -> Result<(), String> {
          self.voice = Some(name.to_string());
-@@ -132,6 +158,238 @@ impl Engine {
+@@ -132,6 +158,259 @@ impl Engine {
              total_ms: start.elapsed().as_secs_f64() * 1e3,
          })
      }
@@ -298,18 +298,39 @@ index d250337..ce2c02e 100644
 +
 +/// Check a prompt's length against the checkpoint's bounds and trim it to the maximum, as
 +/// `Synth::add_voice_from_pcm` does. The caller normalizes loudness beforehand.
++/// The checkpoint's prompt bounds, held to what a person can actually record.
++///
++/// `audio_prompt_min_duration` is the *training* prompt length: Cilla Mini says `min = max = 10.0`,
++/// which `Synth::add_voice_from_pcm` enforces exactly, so a 3-second recording is an error there.
++/// Cloning is not training, and the app offers 3-second prompts (and accepts anything over half a
++/// second), so the floor is clamped instead of passed through. The ceiling is clamped too: a
++/// checkpoint cannot need more prompt than the encoder was trained to see.
++///
++/// These are the same numbers as `AudioDecoder.clampPromptBounds` in the app: it trims the prompt
++/// with them before this sees it, so a mismatch would mean the app accepting a prompt the clone
++/// then refuses.
++const MIN_PROMPT_SECONDS: f32 = 0.5;
++const MAX_PROMPT_SECONDS: f32 = 30.0;
++
++fn prompt_bounds(cfg: &ptts::tts_model::TTSConfig) -> (f32, f32) {
++    let min = cfg.audio_prompt_min_duration.clamp(MIN_PROMPT_SECONDS, 10.0);
++    let max = cfg.audio_prompt_max_duration.clamp(5.0, MAX_PROMPT_SECONDS).max(min);
++    (min, max)
++}
++
 +fn prompt_samples(
 +    cfg: &ptts::tts_model::TTSConfig,
 +    pcm: &[f32],
 +    speaker_sr: u32,
 +) -> Result<Vec<f32>, String> {
-+    let min_len = (speaker_sr as f32 * cfg.audio_prompt_min_duration).round() as usize;
-+    let max_len = (speaker_sr as f32 * cfg.audio_prompt_max_duration).round() as usize;
++    let (min_seconds, max_seconds) = prompt_bounds(cfg);
++    let min_len = (speaker_sr as f32 * min_seconds).round() as usize;
++    let max_len = (speaker_sr as f32 * max_seconds).round() as usize;
 +    if pcm.len() < min_len {
 +        return Err(format!(
 +            "voice prompt is too short: got {:.2}s, need at least {:.2}s",
 +            pcm.len() as f32 / speaker_sr as f32,
-+            cfg.audio_prompt_min_duration
++            min_seconds
 +        ));
 +    }
 +    Ok(pcm[..pcm.len().min(max_len)].to_vec())
@@ -385,10 +406,10 @@ index d250337..ce2c02e 100644
  
  #[cfg(test)]
 diff --git a/ptts-ffi/src/lib.rs b/ptts-ffi/src/lib.rs
-index 45c4832..0f9c2b6 100644
+index 45c4832..7812ba2 100644
 --- a/ptts-ffi/src/lib.rs
 +++ b/ptts-ffi/src/lib.rs
-@@ -274,6 +274,310 @@ pub unsafe extern "C" fn ptts_free(h: *mut PttsHandle) {
+@@ -274,6 +274,331 @@ pub unsafe extern "C" fn ptts_free(h: *mut PttsHandle) {
      }
  }
  
@@ -678,22 +699,43 @@ index 45c4832..0f9c2b6 100644
 +
 +/// Free the string [`ptts_clone_voices_to_dir`] returned.
 +///
++/// The buffer is a NUL-separated list, so it cannot be a `CString` (which rejects interior NULs
++/// and appends a terminator of its own); it is allocated as a plain `Vec<u8>` with a length
++/// prefix, `ptts_strings_free` reads that prefix back and drops the box.
++///
 +/// # Safety
 +/// `s` must be null or come from `ptts_clone_voices_to_dir`, and must not be used afterwards.
 +#[unsafe(no_mangle)]
 +pub unsafe extern "C" fn ptts_strings_free(s: *mut c_char) {
-+    if !s.is_null() {
-+        drop(unsafe { CString::from_raw(s) });
-+    }
++    free_blob(s);
 +}
 +
 +/// [`nul_separated`] as an owned C string the caller frees with [`ptts_strings_free`]. The bytes
 +/// form a valid `CString` by construction: names are UTF-8 without NUL and each is terminated.
 +fn nul_separated_c(names: Vec<String>) -> *mut c_char {
-+    match CString::new(nul_separated(&names)) {
-+        Ok(s) => s.into_raw(),
-+        Err(_) => std::ptr::null_mut(),
++    // `CString::new` cannot hold this: the blob's interior NULs are the separators. A length
++    // prefix in one allocation is what `free_blob` reads back, so the caller needs only the
++    // one `ptts_strings_free` it already has.
++    let blob = nul_separated(&names);
++    let mut out = Vec::with_capacity(blob.len() + std::mem::size_of::<usize>());
++    out.extend_from_slice(&blob.len().to_ne_bytes());
++    out.extend_from_slice(&blob);
++    let boxed = out.into_boxed_slice();
++    Box::into_raw(boxed) as *mut u8 as *mut c_char
++}
++
++/// [`nul_separated_c`]'s inverse: the bytes it allocated, given back as an owned box.
++fn free_blob(s: *mut c_char) {
++    if s.is_null() {
++        return;
 +    }
++    let p = s as *mut u8;
++    // Safety: `ptts_strings_free`'s contract is that `s` comes from `nul_separated_c`, which
++    // always writes this prefix.
++    let len = unsafe { std::ptr::read_unaligned(p as *const usize) };
++    let total = std::mem::size_of::<usize>() + len;
++    // Safety: the same `Vec<u8>` allocation with the same length it was built from.
++    drop(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(p, total)) });
 +}
 +
  #[cfg(test)]

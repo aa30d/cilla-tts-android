@@ -9,7 +9,8 @@ if [[ "${1:-}" == "--native" || "${BUILD_NATIVE:-0}" == "1" || ! -f app/src/main
   ./native/build-ptts-ffi.sh
 fi
 
-python3 native/check-ptts-ffi.py "$(cd "$(dirname "$0")" && pwd)/app/src/main/jniLibs"
+python3 "$(cd "$(dirname "$0")" && pwd)/native/check-ptts-ffi.py" \
+  "$(cd "$(dirname "$0")" && pwd)/app/src/main/jniLibs"
 
 ./gradlew assembleDebug --no-daemon --max-workers=1 -Dorg.gradle.jvmargs=-Xmx1024m
 echo "APK built at: app/build/outputs/apk/debug/app-debug.apk"

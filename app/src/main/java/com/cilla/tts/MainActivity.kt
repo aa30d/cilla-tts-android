@@ -761,8 +761,16 @@ class MainActivity : AppCompatActivity() {
             setText("voice_${System.currentTimeMillis() % 1000}")
             setSelection(text.length)
         }
+        val (minSeconds, maxSeconds) = ModelStorage.promptDurationBounds(this, defaultTarget)
+        val preferred = maxSeconds.coerceAtMost(10f).coerceAtLeast(3f)
+        val maxRecordSeconds = maxSeconds.coerceAtLeast(5f).coerceAtMost(15f)
         val timerText = TextView(this).apply {
-            text = "۳ تا ۱۰ ثانیه در محیط آرام صحبت کنید و با مکث کوتاه پایان دهید."
+            text = String.format(
+                Locale.US,
+                "%.0f تا %.0f ثانیه در محیط آرام صحبت کنید و با مکث کوتاه پایان دهید.",
+                minSeconds.coerceAtLeast(3f).coerceAtMost(preferred),
+                preferred
+            )
             textSize = 13f
             setPadding(0, dp(10), 0, dp(8))
         }
@@ -792,7 +800,10 @@ class MainActivity : AppCompatActivity() {
                 recordedPcm = pcm
                 val secs = pcm.size.toFloat() / AudioDecoder.TARGET_SAMPLE_RATE.toFloat()
                 recordBtn.text = "● ضبط مجدد"
-                if (secs >= AudioDecoder.MIN_PROMPT_SECONDS) {
+                // The bounds the save path enforces, not the generic constant: on Cilla Mini the
+                // minimum is 10 s, so a 5 s recording would otherwise be accepted here and then
+                // rejected by `validateAndTrimPrompt`.
+                if (secs >= minSeconds) {
                     timerText.text = String.format(
                         Locale.US,
                         "ضبط آماده است (%.1f ثانیه). «ساخت گوینده» را بزنید.",
@@ -802,8 +813,9 @@ class MainActivity : AppCompatActivity() {
                 } else {
                     timerText.text = String.format(
                         Locale.US,
-                        "ضبط خیلی کوتاه بود (%.1f ثانیه)؛ حداقل ۱ ثانیه و ترجیحاً ۳ تا ۱۰ ثانیه ضبط کنید.",
-                        secs
+                        "ضبط خیلی کوتاه بود (%.1f ثانیه)؛ حداقل %.1f ثانیه ضبط کنید.",
+                        secs,
+                        minSeconds
                     )
                     saveBtn.isEnabled = false
                 }
@@ -818,14 +830,16 @@ class MainActivity : AppCompatActivity() {
                     recordBtn.text = "■ پایان ضبط"
                     timerText.text = "در حال ضبط: 0.0 ثانیه..."
                     recorder.start(
-                        maxSeconds = 15f,
+                        maxSeconds = maxRecordSeconds,
                         onTick = { secs ->
                             runOnUiThread {
                                 if (recorder.isRecording) {
                                     timerText.text = String.format(
                                         Locale.US,
-                                        "در حال ضبط: %.1f / 15.0 ثانیه (پیشنهاد: ۳ تا ۱۰ ثانیه)",
-                                        secs
+                                        "در حال ضبط: %.1f / %.1f ثانیه (پیشنهاد: تا %.0f ثانیه)",
+                                        secs,
+                                        maxRecordSeconds,
+                                        preferred
                                     )
                                 }
                             }
@@ -1151,13 +1165,42 @@ class MainActivity : AppCompatActivity() {
         populateVoices()
     }
 
+    /**
+     * How long a prompt should be, in words, from [ModelStorage.promptDurationBounds].
+     *
+     * The preferred range is 3 to 10 seconds where the checkpoint allows it; when it does not
+     * (Cilla Mini's config says 10 s and the native clone holds it at 10), the ceiling is what
+     * bounds say and the minimum is only the hard floor, said as such -- the two used to be
+     * printed as "۳ تا ۱۰ … (حداقل ۱۰ ثانیه)", which contradicts itself.
+     */
+    private fun promptHint(kind: ModelKind): String {
+        val (minSeconds, maxSeconds) = ModelStorage.promptDurationBounds(this, kind)
+        // The longest prompt worth asking for: the checkpoint's ceiling, or 10 s when it allows
+        // more, because a longer recording is trimmed anyway.
+        val longest = maxSeconds.coerceAtMost(10f)
+        return if (minSeconds >= 3f) {
+            // The checkpoint's own floor is already in the preferred range (Cilla Mini: 10 s), so
+            // there is no 3-second option to offer and the floor is the size to aim for.
+            String.format(
+                Locale.US,
+                "حدود %.0f ثانیه صحبت کنید یا فایل صوتی بدهید (حداقل %.1f ثانیه).",
+                minSeconds,
+                minSeconds
+            )
+        } else {
+            String.format(
+                Locale.US,
+                "۳ تا %.0f ثانیه صحبت کنید یا فایل صوتی بدهید (حداقل %.1f ثانیه).",
+                longest,
+                minSeconds
+            )
+        }
+    }
+
     private fun updateCloneSection() {
         val target = resolveCloneTarget()
         binding.cloneStatusText.text = if (target != null) {
-            val (minSeconds, maxSeconds) = ModelStorage.promptDurationBounds(this, target)
-            val range = if (maxSeconds > 10f) "۳ تا ۱۰" else "۳ تا ${maxSeconds.toInt()}"
-            "مدل هدف کلون صدا: ${target.label} — $range ثانیه صحبت کنید یا فایل صوتی بدهید " +
-                "(حداقل ${minSeconds.toInt()} ثانیه)."
+            "مدل هدف کلون صدا: ${target.label} — ${promptHint(target)}"
         } else {
             // Say which model is missing what, rather than a generic "install a model".
             cloneUnavailableStatus()
