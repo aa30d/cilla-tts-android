@@ -246,7 +246,11 @@ class PhononTTS(modelDir: String, lang: String) : AutoCloseable {
         val hasAddVoiceFfi: Boolean by lazy { hasSymbol("ptts_add_voice_file") }
         val hasVoiceCloningFfi: Boolean by lazy { hasSymbol("ptts_clone_voice_to_file") }
         val hasSupportsVoiceCloningFfi: Boolean by lazy { hasSymbol("ptts_supports_voice_cloning") }
-        val hasBatchCloneFfi: Boolean by lazy { hasSymbol("ptts_clone_voices_to_dir") }
+        // `BatchLib` resolves both functions when JNA loads it, and the batch result is freed with
+        // `ptts_strings_free`, so a library with one and not the other is not usable.
+        val hasBatchCloneFfi: Boolean by lazy {
+            hasSymbol("ptts_clone_voices_to_dir") && hasSymbol("ptts_strings_free")
+        }
         private val batchLib: BatchLib by lazy { Native.load("ptts_ffi", BatchLib::class.java) }
 
         /**
