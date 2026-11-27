@@ -94,7 +94,7 @@ APP_HOME=$( cd -P "${APP_HOME:-./}" > /dev/null && printf '%s\n' "$PWD" ) || exi
 if [ -f "$APP_HOME/native/check-ptts-ffi.py" ]; then
     if ! command -v python3 >/dev/null 2>&1; then
         echo "warning: python3 not found; skipping the libptts_ffi.so symbol check" >&2
-    elif ! python3 "$APP_HOME/native/check-ptts-ffi.py" "$APP_HOME"; then
+    elif ! python3 "$APP_HOME/native/check-ptts-ffi.py" "$APP_HOME/app/src/main/jniLibs"; then
         echo "" >&2
         echo "The APK would ship a native library this code cannot call." >&2
         echo "Build it with ./native/build-ptts-ffi.sh (Rust + cargo-ndk + Android NDK)," >&2

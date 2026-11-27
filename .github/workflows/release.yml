@@ -101,7 +101,9 @@ jobs:
           cp native/.cache/jniLibs/x86_64/libptts_ffi.so app/src/main/jniLibs/x86_64/libptts_ffi.so
           # The build script writes this next to the library; a cache hit skips that step.
           bash native/build-ptts-ffi.sh --symbols-only
-          python3 native/check-ptts-ffi.py "$PWD"
+          cp app/src/main/jniLibs/ptts-ffi.symbols native/.cache/jniLibs/ptts-ffi.symbols
+          python3 native/check-ptts-ffi.py native/.cache/jniLibs
+          python3 native/check-ptts-ffi.py app/src/main/jniLibs
 
       - name: Build release APK
         run: >-

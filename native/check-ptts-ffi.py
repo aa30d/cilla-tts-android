@@ -1,19 +1,31 @@
 #!/usr/bin/env python3
-"""Fail when a libptts_ffi.so in jniLibs is missing a symbol the app calls."""
-import sys, pathlib
+"""Fail when a libptts_ffi.so is missing a symbol the app calls.
 
-def main(root):
-    jni = pathlib.Path(root) / "app/src/main/jniLibs"
+Usage: native/check-ptts-ffi.py [JNI_LIBS_DIR]
+
+JNI_LIBS_DIR defaults to app/src/main/jniLibs. It is a parameter because the native build stages
+its libraries in native/.work and callers check them *before* copying them into the app, so a
+checker that only looked at the app directory would either fail on a clean tree or pass on
+libraries nobody had built yet.
+"""
+import pathlib
+import sys
+
+
+def main(jni_libs):
+    jni = pathlib.Path(jni_libs)
     manifest = jni / "ptts-ffi.symbols"
-    if not manifest.is_file():
+    symbols = []
+    if manifest.is_file():
+        symbols = [
+            line.strip() for line in manifest.read_text().splitlines()
+            if line.strip() and not line.startswith("#")
+        ]
+    else:
         print(f"warning: {manifest} is missing; run native/build-ptts-ffi.sh", file=sys.stderr)
-    symbols = [
-        line.strip() for line in manifest.read_text().splitlines()
-        if line.strip() and not line.startswith("#")
-    ] if manifest.is_file() else []
-    libs = sorted(p for p in jni.glob("*/libptts_ffi.so"))
+    libs = sorted(jni.glob("*/libptts_ffi.so"))
     if not libs:
-        print("error: no libptts_ffi.so under app/src/main/jniLibs", file=sys.stderr)
+        print(f"error: no libptts_ffi.so under {jni}", file=sys.stderr)
         return 1
     bad = 0
     for lib in libs:
@@ -25,5 +37,11 @@ def main(root):
             print("       rebuild it with ./native/build-ptts-ffi.sh", file=sys.stderr)
     return bad
 
+
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1] if len(sys.argv) > 1 else "."))
+    target = sys.argv[1] if len(sys.argv) > 1 else "app/src/main/jniLibs"
+    # Accept the repository root too, so an older invocation keeps working.
+    root = pathlib.Path(target)
+    if (root / "app/src/main/jniLibs").is_dir():
+        target = root / "app/src/main/jniLibs"
+    sys.exit(main(target))
