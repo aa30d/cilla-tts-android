@@ -58,11 +58,10 @@ android {
 val checkPttsFfi by tasks.registering(Exec::class) {
     group = "verification"
     description = "Checks app/src/main/jniLibs/libptts_ffi.so against its symbol manifest"
-    commandLine(
-            "python3",
-            "native/check-ptts-ffi.py",
-            layout.projectDirectory.dir("src/main/jniLibs").asFile.absolutePath
-        )
+    // Absolute, from `rootDir`: a task in the `app` module starts in `app/`, not in the root.
+    val script = File(rootDir, "native/check-ptts-ffi.py")
+    val jniLibs = File(rootDir, "app/src/main/jniLibs")
+    commandLine("python3", script.absolutePath, jniLibs.absolutePath)
 }
 
 tasks.matching { it.name.startsWith("merge") && it.name.endsWith("JniLibFolders") }
